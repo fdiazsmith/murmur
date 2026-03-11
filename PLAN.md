@@ -1,132 +1,131 @@
-# Murmur — macOS Voice-to-Text Menu Bar App
+# Murmur — Roadmap
 
-## Context
+Living document. Completed work removed, only upcoming work lives here.
 
-Build a lightweight macOS menu bar app that records speech via microphone, transcribes it using either **WhisperKit (local, on-device)** or **OpenAI Whisper API (cloud)**, and pastes the result at the current cursor position. Inspired by Wispr Flow but with a local-first, privacy-respecting approach.
+## Done (v0.0.1)
+- [x] Menu bar app skeleton (MenuBarExtra, no Dock icon)
+- [x] Floating pill (NSPanel, non-activating, screen-capture excluded)
+- [x] Audio recording (AVAudioEngine, 16kHz mono WAV)
+- [x] Local transcription (WhisperKit on-device)
+- [x] Cloud transcription (OpenAI Whisper API)
+- [x] Paste at cursor (NSPasteboard + CGEvent Cmd+V)
+- [x] Global hotkey (Ctrl+Shift+Space via CGEvent tap)
+- [x] DMG packaging + ad-hoc signing
+- [x] Uninstall from menu dropdown
 
-## Key Differentiators vs Wispr Flow
-- **Local-first** — WhisperKit runs on Apple Silicon, no internet needed. Cloud API optional.
-- **Privacy** — no screenshots, no data retention. Cloud mode only sends audio to OpenAI.
-- **Lightweight** — minimal resource usage when idle
-- **Free/open** — no subscription (cloud mode needs your own API key)
+---
 
-## Architecture
+## v0.1.0 — Quality of Life
 
+### Transcription History
+Browse and copy the last 10 transcriptions from menu dropdown.
+
+- New section in `MenuBarView` between provider picker and Quit
+- List of up to 10 entries, most recent first
+- Each entry: truncated text (~60 chars) + relative timestamp ("2m ago")
+- Click → copy full text to clipboard, brief "Copied" confirmation
+- "Clear History" button at bottom
+- Storage: `[TranscriptionEntry]` on AppState, persisted to UserDefaults
+- Struct: `TranscriptionEntry { id: UUID, text: String, timestamp: Date }`
+
+### Audio During Recording
+Handle playback audio gracefully during short hold-to-speak bursts.
+
+**Auto-duck (default):** fade system volume to ~20% on record start, restore on stop. Uses `CoreAudio` / `AudioObjectSetPropertyData`. No device profile switch — playback stays high-quality.
+
+**Recording mode (opt-in):** switch audio session to `.playAndRecord` + `.duckOthers`. On Bluetooth triggers HFP/SCO codec switch. Only for noisy environments.
+
+Settings: picker (None / Auto-duck / Recording mode), duck level slider, mute toggle.
+
+### In-App Feedback (Bug Report / Feature Request)
+Let users submit feedback directly from the menu dropdown without leaving the app.
+
+**UX Flow:**
+1. Menu dropdown → "Report Bug..." or "Request Feature..."
+2. Opens a small floating `NSPanel` (same style as pill — non-activating, stays on top)
+3. Panel contains: title field, description text area, submit button, cancel button
+4. On submit → opens browser to pre-filled GitHub issue URL
+5. Panel dismisses
+
+**Why browser redirect (v1):**
+- GitHub API requires auth even on public repos
+- No token to leak, no proxy to maintain
+- User gets to review before submitting
+- Works if repo is public (make repo public for this)
+
+**GitHub URL format:**
 ```
-MurmurApp (@main)
-  ├── MenuBarExtra (mic icon next to clock, dropdown with status/quit)
-  ├── PillWindowController (floating NSPanel, screen-capture excluded)
-  │     └── PillOverlay (SwiftUI capsule view: hover/click)
-  └── AppState (central state machine)
-        ├── AudioRecorder (AVAudioEngine → 16kHz mono WAV)
-        ├── TranscriptionProvider (protocol)
-        │     ├── LocalTranscriber (WhisperKit, "base" model)
-        │     └── CloudTranscriber (OpenAI Whisper API)
-        └── PasteService (NSPasteboard + CGEvent Cmd+V)
+https://github.com/fdiazsmith/murmur/issues/new?
+  labels=bug&
+  title={url-encoded title}&
+  body={url-encoded description}
 ```
+Labels: `bug` for bug reports, `enhancement` for feature requests. Create these labels in the repo.
 
-## File Structure
+**Issue templates** (create in `.github/ISSUE_TEMPLATE/`):
+- `bug_report.md` — pre-filled with OS version, Murmur version, steps to reproduce
+- `feature_request.md` — pre-filled with description, use case
 
-```
-Murmur/
-├── MurmurApp.swift              — @main, MenuBarExtra scene, pill init
-├── Info.plist                   — LSUIElement=YES, mic usage description
-├── Murmur.entitlements          — no sandbox, audio-input
-├── Assets.xcassets/             — app icon, menu bar icon (SF Symbol fallback)
-├── Models/
-│   └── AppState.swift           — state machine: idle→recording→transcribing→done
-├── Views/
-│   ├── MenuBarView.swift        — dropdown: status, model info, quit
-│   └── PillOverlay.swift        — capsule shape, hover/click, color by state
-├── Windows/
-│   └── PillWindowController.swift — NSPanel: floating, non-activating, capture-excluded
-├── Services/
-│   ├── AudioRecorder.swift        — AVAudioEngine, real-time resample to 16kHz mono
-│   ├── TranscriptionProvider.swift — protocol: func transcribe(fileURL:) async throws → String
-│   ├── LocalTranscriber.swift     — WhisperKit backend (on-device)
-│   ├── CloudTranscriber.swift     — OpenAI Whisper API backend (multipart upload)
-│   └── PasteService.swift         — clipboard write + CGEvent Cmd+V simulation
-└── Utilities/
-    └── Permissions.swift        — mic permission request, accessibility check
-```
+**Approach: embedded PAT (v1)**
+- Fine-grained GitHub PAT scoped to `fdiazsmith/murmur` with Issues read/write only
+- Token read from `.env` at build time, XOR-obfuscated in binary (not plain text in `strings`)
+- `Services/GitHubIssueService.swift` — POST to `api.github.com/repos/fdiazsmith/murmur/issues`
+- Body: `{ "title": "...", "body": "...", "labels": ["bug"] }` or `["enhancement"]`
+- No browser redirect, fully in-app submission
+- Tradeoff: token extractable from binary, worst case = spam issues (revocable)
 
-## Interaction Model: Hold-to-Speak
+**Implementation:**
+- `Windows/FeedbackWindowController.swift` — NSPanel, same pattern as PillWindowController
+- `Views/FeedbackView.swift` — SwiftUI form (title, description, type picker: Bug/Feature)
+- `Services/GitHubIssueService.swift` — API call, token deobfuscation, error handling
+- `scripts/bundle.sh` reads `.env` and injects token via build flag or code generation
+- Auto-populates issue body with: Murmur version, macOS version, selected provider
+- On success: dismiss panel, show brief "Submitted" toast
+- On error: show inline error, offer to copy issue text for manual submission
 
-Like Wispr Flow — **hold the pill (or global hotkey) to record, release to transcribe and paste**. This is more natural than click-toggle: hold → speak → release → text appears.
+### Auto-Update
+Check for new releases on launch, notify user, download and replace.
 
-- **Pill**: mouseDown starts recording, mouseUp stops and triggers transcription
-- **Global hotkey** (Phase 6): register a system-wide shortcut (e.g. Ctrl+Shift+Space) via `CGEvent` tap or `NSEvent.addGlobalMonitorForEvents` — keyDown starts, keyUp stops
+**How it works:**
+1. On app launch (and every 24h while running), `GET https://api.github.com/repos/fdiazsmith/murmur/releases/latest`
+2. Compare `tag_name` (e.g. `v0.1.0`) against current `CFBundleShortVersionString`
+3. If remote is newer → show banner in menu dropdown: "Update available: v0.1.0"
+4. User clicks → downloads DMG asset from the release, opens it
+5. User drags new .app to /Applications (standard DMG install)
 
-## Implementation Phases
+**Semantic versioning:** tags follow `vMAJOR.MINOR.PATCH`. Compare using Swift's `OperatingSystemVersion` or a simple semver parser.
 
-### Phase 1: Project Skeleton
-Create Xcode project (macOS App, SwiftUI, deployment target macOS 14.0). Set up:
-- `MurmurApp.swift` with `MenuBarExtra` (system mic icon)
-- `MenuBarView.swift` with status display + Quit button
-- `AppState.swift` with state enum
-- `Info.plist`: `LSUIElement = YES`, `NSMicrophoneUsageDescription`
-- `Murmur.entitlements`: sandbox OFF, audio-input ON
+**Implementation:**
+- `Services/UpdateChecker.swift` — fetches latest release, compares versions
+- Struct: `GitHubRelease { tagName, htmlURL, assets: [{ name, browserDownloadURL }] }`
+- Parse JSON from releases API (public endpoint, no auth needed)
+- `@Published var updateAvailable: (version: String, url: URL)?` on AppState
+- `MenuBarView` shows update banner when non-nil
+- Click downloads DMG via `NSWorkspace.shared.open(url)` (opens in browser/Finder)
+- Store `lastUpdateCheck: Date` in UserDefaults, skip if < 24h ago
+- No auto-replace (risky without code signing) — user handles install from DMG
 
-**Verify:** Build & run → mic icon in menu bar, no Dock icon, dropdown shows quit.
+**Future (v2):** true auto-update with Sparkle framework (if we get a Developer ID for proper signing).
 
-### Phase 2: Floating Pill
-- `PillWindowController.swift`: `NSPanel` with `.borderless`, `.nonactivatingPanel`, `.floating` level, `sharingType = .none`, `canJoinAllSpaces`, `stationary`, `ignoresCycle`, transparent background
-- `PillOverlay.swift`: capsule with SF Symbol mic icon, changes color on state (gray=idle, red=recording, orange=transcribing), hover effect
-- Pill positioned **bottom-right** of screen (above Dock, inset ~20px from right edge)
-- Non-activating so interacting doesn't steal focus from current app
+---
 
-**Verify:** Pill floats bottom-right, doesn't appear in screenshots, doesn't steal focus.
+## v0.2.0 — Polish
 
-### Phase 3: Audio Recording
-- `AudioRecorder.swift`: `AVAudioEngine` with input tap, `AVAudioConverter` for 16kHz mono Float32 PCM, writes to temp WAV file
-- `Permissions.swift`: `AVCaptureDevice.requestAccess(for: .audio)` + `AXIsProcessTrustedWithOptions` for accessibility
-- Wire pill **mouseDown → start recording, mouseUp → stop recording** (hold-to-speak)
+### Configurable Hotkey
+Let users change the global hotkey from menu settings. Store in UserDefaults.
 
-**Verify:** Hold pill, speak, release → temp WAV file exists and plays correctly.
+### Model Picker
+Let users choose WhisperKit model size (tiny/base/small/medium). Larger = more accurate but slower.
 
-### Phase 4: Transcription (Local + Cloud)
-- `TranscriptionProvider.swift`: protocol with `func transcribe(fileURL: URL) async throws -> String`
-- `LocalTranscriber.swift`: WhisperKit backend — add SPM dep (`https://github.com/argmaxinc/WhisperKit.git`, from `0.9.0`), load "base" model (~140MB, auto-downloaded first run)
-- `CloudTranscriber.swift`: OpenAI API backend — multipart POST to `https://api.openai.com/v1/audio/transcriptions` with model `whisper-1`, sends WAV file, returns text. API key stored in `UserDefaults`/Keychain.
-- `AppState` holds selected provider, switchable from menu dropdown
-- `MenuBarView` gets a picker: Local / Cloud + API key field (shown when Cloud selected)
+### Onboarding
+First-launch flow: request permissions, explain hold-to-speak, test recording.
 
-**Verify:** Hold pill, speak, release → text appears in menu bar status (test both backends).
+---
 
-### Phase 5: Paste at Cursor
-- `PasteService.swift`: write text to `NSPasteboard`, simulate Cmd+V via `CGEvent`, restore previous clipboard after 0.5s
-- Accessibility permission prompt via `AXIsProcessTrustedWithOptions`
-- Wire transcription complete → paste at cursor
-
-**Verify:** Open TextEdit, hold pill, speak, release → text appears in TextEdit.
-
-### Phase 6: Polish & Global Hotkey
-- Pulsing animation on pill during recording
-- Spinner state during transcription
-- Error handling (no mic, model fail, empty transcription)
-- **Global hotkey** (e.g. Ctrl+Shift+Space): hold to record from anywhere without needing to reach the pill. Uses `NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .keyUp])`
-
-## Dependencies
-- **WhisperKit** (`argmaxinc/WhisperKit`) — on-device Whisper, SPM
-- No extra deps for cloud — uses Foundation `URLSession` for OpenAI API calls
-
-## Permissions Required
-| Permission | Mechanism | Why |
-|---|---|---|
-| Microphone | Runtime prompt (Info.plist) | Audio recording |
-| Accessibility | Manual grant in System Settings | CGEvent paste simulation |
-| No Sandbox | Entitlements | Accessibility APIs don't work in sandbox |
-| Network | Auto (no sandbox) | Model download (local) or API calls (cloud) |
-
-## Prerequisites
-- **Xcode.app** must be installed (not just Command Line Tools) — SwiftUI menu bar apps need the full SDK
-- macOS 14.0+ (WhisperKit requirement)
-- Apple Silicon recommended (WhisperKit uses CoreML/ANE)
-
-## Verification (End-to-End)
-1. Build & run in Xcode (Cmd+R)
-2. Menu bar shows mic icon, no Dock icon
-3. Floating pill visible at bottom-right, excluded from screenshots
-4. Hold pill → turns red (recording) → speak → release → turns orange (transcribing)
-5. After ~2-3s, transcribed text appears at cursor in whatever app was focused
-6. Menu bar dropdown shows last transcription
+## Backlog (unprioritized)
+- Multi-language support (WhisperKit language param)
+- Streaming transcription (show partial results while speaking)
+- Custom prompt/context for Whisper API (improve accuracy for domain-specific terms)
+- Launch at login (LoginItem)
+- Menubar icon changes color during recording (like pill does)
+- Keyboard shortcut to copy last transcription without re-recording

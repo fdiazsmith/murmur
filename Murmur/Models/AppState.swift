@@ -25,17 +25,34 @@ class AppState: ObservableObject {
     }
     @Published var lastTranscription: String = ""
 
+    // v0.1.0: Transcription history
+    @Published var history: [TranscriptionEntry] = [] {
+        didSet { persistHistory() }
+    }
+
+    // v0.1.0: Audio ducking
+    @Published var duckMode: AudioDuckMode = .autoDuck {
+        didSet { UserDefaults.standard.set(duckMode.rawValue, forKey: "duckMode") }
+    }
+    @Published var duckLevel: Float = 0.2 {
+        didSet { UserDefaults.standard.set(duckLevel, forKey: "duckLevel") }
+    }
+
+    // v0.1.0: Update checker
+    @Published var updateAvailable: AvailableUpdate?
+
+    // Controllers (retained)
     var pillController: PillWindowController?
     var hotkeyManager: HotkeyManager?
+    var feedbackController: FeedbackWindowController?
 
     let audioRecorder = AudioRecorder()
+    let audioDucker = AudioDucker()
 
     private var currentProvider: any TranscriptionProvider {
         switch selectedProvider {
-        case .local:
-            return localTranscriber
-        case .cloud:
-            return CloudTranscriber(apiKey: apiKey)
+        case .local: return localTranscriber
+        case .cloud: return CloudTranscriber(apiKey: apiKey)
         }
     }
 
@@ -47,6 +64,14 @@ class AppState: ObservableObject {
             selectedProvider = provider
         }
         apiKey = UserDefaults.standard.string(forKey: "openaiAPIKey") ?? ""
+
+        if let saved = UserDefaults.standard.string(forKey: "duckMode"),
+           let mode = AudioDuckMode(rawValue: saved) {
+            duckMode = mode
+        }
+        duckLevel = UserDefaults.standard.object(forKey: "duckLevel") as? Float ?? 0.2
+
+        loadHistory()
     }
 
     func startRecording() {
@@ -55,10 +80,12 @@ class AppState: ObservableObject {
             return
         }
         do {
+            audioDucker.duck(mode: duckMode, level: duckLevel)
             try audioRecorder.start()
             state = .recording
             print("[Murmur] Recording started")
         } catch {
+            audioDucker.restore()
             print("[Murmur] Mic error: \(error)")
             state = .error("Mic error: \(error.localizedDescription)")
             resetStateAfterDelay()
@@ -70,6 +97,8 @@ class AppState: ObservableObject {
             print("[Murmur] stopRecording skipped, state=\(state)")
             return
         }
+        audioDucker.restore()
+
         guard let fileURL = audioRecorder.stop() else {
             print("[Murmur] No audio file produced")
             state = .error("No audio recorded")
@@ -93,6 +122,7 @@ class AppState: ObservableObject {
                 }
                 print("[Murmur] Transcribed: \(text.prefix(80))")
                 lastTranscription = text
+                addToHistory(text)
                 PasteService.paste(text)
                 state = .done(text)
                 resetStateAfterDelay()
@@ -101,6 +131,52 @@ class AppState: ObservableObject {
                 state = .error("Transcription failed: \(error.localizedDescription)")
                 resetStateAfterDelay()
             }
+        }
+    }
+
+    func clearHistory() {
+        history.removeAll()
+    }
+
+    func checkForUpdates() {
+        Task {
+            updateAvailable = await UpdateChecker.checkIfNeeded()
+            if let update = updateAvailable {
+                print("[Murmur] Update available: v\(update.version)")
+            }
+        }
+    }
+
+    @Published var feedbackType: IssueType = .bug
+
+    func showFeedback(type: IssueType = .bug) {
+        feedbackType = type
+        if feedbackController == nil {
+            feedbackController = FeedbackWindowController(appState: self)
+        }
+        feedbackController?.show()
+    }
+
+    // MARK: - Private
+
+    private func addToHistory(_ text: String) {
+        let entry = TranscriptionEntry(text: text)
+        history.insert(entry, at: 0)
+        if history.count > 10 {
+            history = Array(history.prefix(10))
+        }
+    }
+
+    private func persistHistory() {
+        if let data = try? JSONEncoder().encode(history) {
+            UserDefaults.standard.set(data, forKey: "transcriptionHistory")
+        }
+    }
+
+    private func loadHistory() {
+        if let data = UserDefaults.standard.data(forKey: "transcriptionHistory"),
+           let saved = try? JSONDecoder().decode([TranscriptionEntry].self, from: data) {
+            history = saved
         }
     }
 

@@ -3,3 +3,5 @@
 .omc/
 .swiftpm/
 dist/
+.env
+Murmur/Generated/

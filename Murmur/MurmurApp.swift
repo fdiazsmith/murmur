@@ -11,6 +11,7 @@ struct MurmurApp: App {
                     _ = await Permissions.requestMicrophoneAccess()
                     _ = Permissions.requestAccessibilityAccess()
                     showPillIfNeeded()
+                    appState.checkForUpdates()
                 }
         }
     }

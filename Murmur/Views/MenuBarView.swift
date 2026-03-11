@@ -2,16 +2,29 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var appState: AppState
+    @State private var showUninstallConfirmation = false
+    @State private var copiedEntryId: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            // Update banner
+            if let update = appState.updateAvailable {
+                Button("Update available: v\(update.version)") {
+                    NSWorkspace.shared.open(update.downloadURL)
+                }
+                .foregroundStyle(.blue)
+                Divider()
+            }
+
             statusSection
             Divider()
             providerSection
-            if !appState.lastTranscription.isEmpty {
-                Divider()
-                lastTranscriptionSection
-            }
+            Divider()
+            audioSection
+            Divider()
+            historySection
+            Divider()
+            feedbackSection
             Divider()
             Button("Uninstall Murmur...") {
                 showUninstallConfirmation = true
@@ -24,50 +37,13 @@ struct MenuBarView: View {
         .padding(4)
         .alert("Uninstall Murmur?", isPresented: $showUninstallConfirmation) {
             Button("Cancel", role: .cancel) {}
-            Button("Uninstall", role: .destructive) {
-                Self.uninstall()
-            }
+            Button("Uninstall", role: .destructive) { Self.uninstall() }
         } message: {
             Text("This will remove Murmur from Applications, clear its settings, and quit.")
         }
     }
 
-    @State private var showUninstallConfirmation = false
-
-    private static func uninstall() {
-        // Remove app bundle from /Applications if installed there
-        let appPaths = [
-            "/Applications/Murmur.app",
-            NSHomeDirectory() + "/Applications/Murmur.app",
-        ]
-        for path in appPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                try? FileManager.default.removeItem(atPath: path)
-            }
-        }
-
-        // Remove the running binary's parent .app bundle if applicable
-        let bundlePath = Bundle.main.bundlePath
-        if bundlePath.hasSuffix(".app") {
-            try? FileManager.default.removeItem(atPath: bundlePath)
-        }
-
-        // Clear UserDefaults
-        if let bundleId = Bundle.main.bundleIdentifier {
-            UserDefaults.standard.removePersistentDomain(forName: bundleId)
-        }
-        UserDefaults.standard.removeObject(forKey: "selectedProvider")
-        UserDefaults.standard.removeObject(forKey: "openaiAPIKey")
-
-        // Remove downloaded WhisperKit models
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-        if let whisperCache = cacheDir?.appendingPathComponent("huggingface") {
-            try? FileManager.default.removeItem(at: whisperCache)
-        }
-
-        // Quit
-        NSApplication.shared.terminate(nil)
-    }
+    // MARK: - Sections
 
     @ViewBuilder
     private var statusSection: some View {
@@ -94,14 +70,69 @@ struct MenuBarView: View {
     }
 
     @ViewBuilder
-    private var lastTranscriptionSection: some View {
-        Text("Last:")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        Text(appState.lastTranscription)
-            .font(.caption)
-            .lineLimit(3)
+    private var audioSection: some View {
+        Picker("During recording", selection: $appState.duckMode) {
+            ForEach(AudioDuckMode.allCases, id: \.self) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        if appState.duckMode == .autoDuck {
+            HStack {
+                Text("Volume")
+                    .font(.caption)
+                Slider(value: $appState.duckLevel, in: 0...1)
+                Text("\(Int(appState.duckLevel * 100))%")
+                    .font(.caption)
+                    .frame(width: 32, alignment: .trailing)
+            }
+        }
     }
+
+    @ViewBuilder
+    private var historySection: some View {
+        if appState.history.isEmpty {
+            Text("No transcriptions yet")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            Text("History")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(appState.history) { entry in
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(entry.text, forType: .string)
+                    copiedEntryId = entry.id
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        if copiedEntryId == entry.id { copiedEntryId = nil }
+                    }
+                } label: {
+                    HStack {
+                        Text(copiedEntryId == entry.id ? "Copied!" : entry.truncatedText)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer()
+                        Text(entry.relativeTime)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            Button("Clear History") {
+                appState.clearHistory()
+            }
+            .font(.caption)
+        }
+    }
+
+    @ViewBuilder
+    private var feedbackSection: some View {
+        Button("Report Bug...") { appState.showFeedback(type: .bug) }
+        Button("Request Feature...") { appState.showFeedback(type: .feature) }
+    }
+
+    // MARK: - Helpers
 
     private var statusText: String {
         switch appState.state {
@@ -121,5 +152,34 @@ struct MenuBarView: View {
         case .done: .green
         case .error: .red
         }
+    }
+
+    // MARK: - Uninstall
+
+    private static func uninstall() {
+        let appPaths = [
+            "/Applications/Murmur.app",
+            NSHomeDirectory() + "/Applications/Murmur.app",
+        ]
+        for path in appPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+        }
+        let bundlePath = Bundle.main.bundlePath
+        if bundlePath.hasSuffix(".app") {
+            try? FileManager.default.removeItem(atPath: bundlePath)
+        }
+        if let bundleId = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: bundleId)
+        }
+        for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck"] {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        if let whisperCache = cacheDir?.appendingPathComponent("huggingface") {
+            try? FileManager.default.removeItem(at: whisperCache)
+        }
+        NSApplication.shared.terminate(nil)
     }
 }

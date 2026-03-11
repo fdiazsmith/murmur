@@ -7,6 +7,11 @@ BUNDLE_ID="com.fdiazsmith.murmur"
 APP_DIR="dist/${APP_NAME}.app"
 DMG_NAME="${APP_NAME}-v${VERSION}-macos-arm64.dmg"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "==> Generating obfuscated token..."
+bash "${SCRIPT_DIR}/generate-token.sh"
+
 echo "==> Building release..."
 swift build -c release
 
