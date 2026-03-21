@@ -35,6 +35,18 @@ class AppState: ObservableObject {
         didSet { hotkeyManager?.updateConfig(hotkeyConfig) }
     }
 
+    // Profiles
+    @Published var profiles: [Profile] = Profile.loadAll() {
+        didSet { Profile.saveAll(profiles) }
+    }
+    @Published var selectedProfileId: UUID = Profile.loadSelectedId() {
+        didSet { Profile.saveSelectedId(selectedProfileId) }
+    }
+
+    var selectedProfile: Profile {
+        profiles.first(where: { $0.id == selectedProfileId }) ?? profiles.first ?? .general
+    }
+
     // v0.1.0: Audio ducking
     @Published var duckMode: AudioDuckMode = .autoDuck {
         didSet { UserDefaults.standard.set(duckMode.rawValue, forKey: "duckMode") }
@@ -51,6 +63,7 @@ class AppState: ObservableObject {
     var hotkeyManager: HotkeyManager?
     var feedbackController: FeedbackWindowController?
     var hotkeyRecorderController: HotkeyRecorderWindowController?
+    var profileEditorController: ProfileEditorWindowController?
 
     let audioRecorder = AudioRecorder()
     let audioDucker = AudioDucker()
@@ -120,7 +133,7 @@ class AppState: ObservableObject {
         Task {
             do {
                 print("[Murmur] Transcribing with \(selectedProvider.rawValue)...")
-                let text = try await provider.transcribe(fileURL: fileURL)
+                let text = try await provider.transcribe(fileURL: fileURL, prompt: selectedProfile.prompt)
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     print("[Murmur] Empty transcription")
                     state = .error("Empty transcription")
@@ -156,11 +169,40 @@ class AppState: ObservableObject {
 
     @Published var feedbackType: IssueType = .bug
 
+    func showProfileEditor(profile: Profile? = nil) {
+        if profileEditorController == nil {
+            profileEditorController = ProfileEditorWindowController(appState: self)
+        }
+        profileEditorController?.show(profile: profile)
+    }
+
     func showHotkeyRecorder() {
         if hotkeyRecorderController == nil {
             hotkeyRecorderController = HotkeyRecorderWindowController(appState: self)
         }
         hotkeyRecorderController?.show()
+    }
+
+    // MARK: - Profiles
+
+    func addProfile(name: String, prompt: String) {
+        let profile = Profile(id: UUID(), name: name, prompt: prompt)
+        profiles.append(profile)
+        selectedProfileId = profile.id
+    }
+
+    func updateProfile(_ profile: Profile) {
+        if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
+            profiles[idx] = profile
+        }
+    }
+
+    func deleteProfile(_ profile: Profile) {
+        guard profile.id != Profile.general.id else { return }
+        profiles.removeAll(where: { $0.id == profile.id })
+        if selectedProfileId == profile.id {
+            selectedProfileId = profiles.first?.id ?? Profile.general.id
+        }
     }
 
     func showFeedback(type: IssueType = .bug) {

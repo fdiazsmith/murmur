@@ -4,9 +4,14 @@ import WhisperKit
 final class LocalTranscriber: TranscriptionProvider {
     private var whisperKit: WhisperKit?
 
-    func transcribe(fileURL: URL) async throws -> String {
+    func transcribe(fileURL: URL, prompt: String) async throws -> String {
         let kit = try await resolveWhisperKit()
-        let results = try await kit.transcribe(audioPath: fileURL.path)
+        var options: DecodingOptions? = nil
+        if !prompt.isEmpty, let tokenizer = kit.tokenizer {
+            let tokens = tokenizer.encode(text: prompt)
+            options = DecodingOptions(promptTokens: tokens)
+        }
+        let results = try await kit.transcribe(audioPath: fileURL.path, decodeOptions: options)
         return results.compactMap(\.text).joined(separator: " ").trimmingCharacters(in: .whitespaces)
     }
 

@@ -18,6 +18,8 @@ struct MenuBarView: View {
 
             statusSection
             Divider()
+            profileSection
+            Divider()
             providerSection
             Divider()
             hotkeySection
@@ -69,6 +71,32 @@ struct MenuBarView: View {
             SecureField("OpenAI API Key", text: $appState.apiKey)
                 .textFieldStyle(.roundedBorder)
         }
+    }
+
+    @ViewBuilder
+    private var profileSection: some View {
+        Picker("Profile", selection: $appState.selectedProfileId) {
+            ForEach(appState.profiles) { profile in
+                Text(profile.name).tag(profile.id)
+            }
+        }
+        ForEach(appState.profiles) { profile in
+            Menu("  \(profile.name)...") {
+                Button("Edit...") {
+                    appState.showProfileEditor(profile: profile)
+                }
+                if profile.id != Profile.general.id {
+                    Button("Delete", role: .destructive) {
+                        appState.deleteProfile(profile)
+                    }
+                }
+            }
+            .font(.caption)
+        }
+        Button("Add Profile...") {
+            appState.showProfileEditor()
+        }
+        .font(.caption)
     }
 
     @ViewBuilder
@@ -182,6 +210,7 @@ struct MenuBarView: View {
         }
         HotkeyConfig.clearSaved()
         PillWindowController.clearPosition()
+        Profile.clearSaved()
         for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck"] {
             UserDefaults.standard.removeObject(forKey: key)
         }

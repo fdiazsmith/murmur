@@ -7,7 +7,7 @@ final class CloudTranscriber: TranscriptionProvider {
         self.apiKey = apiKey
     }
 
-    func transcribe(fileURL: URL) async throws -> String {
+    func transcribe(fileURL: URL, prompt: String) async throws -> String {
         let audioData = try Data(contentsOf: fileURL)
         let boundary = UUID().uuidString
 
@@ -15,7 +15,7 @@ final class CloudTranscriber: TranscriptionProvider {
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = buildMultipartBody(audioData: audioData, boundary: boundary)
+        request.httpBody = buildMultipartBody(audioData: audioData, prompt: prompt, boundary: boundary)
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -33,7 +33,7 @@ final class CloudTranscriber: TranscriptionProvider {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func buildMultipartBody(audioData: Data, boundary: String) -> Data {
+    private func buildMultipartBody(audioData: Data, prompt: String, boundary: String) -> Data {
         var body = Data()
 
         body.appendString("--\(boundary)\r\n")
@@ -49,6 +49,12 @@ final class CloudTranscriber: TranscriptionProvider {
         body.appendString("--\(boundary)\r\n")
         body.appendString("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
         body.appendString("text\r\n")
+
+        if !prompt.isEmpty {
+            body.appendString("--\(boundary)\r\n")
+            body.appendString("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+            body.appendString("\(prompt)\r\n")
+        }
 
         body.appendString("--\(boundary)--\r\n")
         return body

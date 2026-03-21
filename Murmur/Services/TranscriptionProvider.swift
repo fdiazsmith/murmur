@@ -1,5 +1,5 @@
 import Foundation
 
 protocol TranscriptionProvider {
-    func transcribe(fileURL: URL) async throws -> String
+    func transcribe(fileURL: URL, prompt: String) async throws -> String
 }

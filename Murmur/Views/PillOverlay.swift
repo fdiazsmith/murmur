@@ -24,33 +24,45 @@ struct PillOverlay: View {
                     .scaleEffect(scaleValue)
                     .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
 
-                if appState.state == .transcribing {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(0.8)
-                        .colorInvert()
-                } else {
-                    pillIcon
-                        .renderingMode(.template)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(height: 24)
-                        .foregroundStyle(.white)
+                HStack(spacing: 0) {
+                    // Profile abbreviation — own hit target, no recording
+                    profileSwitcher
+                        .frame(width: 52, height: 48)
+                        .contentShape(Rectangle())
+
+                    // Recording area — takes the rest
+                    ZStack {
+                        if appState.state == .transcribing {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .scaleEffect(0.8)
+                                .colorInvert()
+                        } else {
+                            pillIcon
+                                .renderingMode(.template)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(height: 24)
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in
+                                guard !isPressing else { return }
+                                isPressing = true
+                                appState.startRecording()
+                            }
+                            .onEnded { _ in
+                                isPressing = false
+                                appState.stopRecordingAndTranscribe()
+                            }
+                    )
                 }
+                .frame(width: 192, height: 48)
             }
-            .contentShape(Capsule())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in
-                        guard !isPressing else { return }
-                        isPressing = true
-                        appState.startRecording()
-                    }
-                    .onEnded { _ in
-                        isPressing = false
-                        appState.stopRecordingAndTranscribe()
-                    }
-            )
         }
         .onHover { hovering in
             isHovering = hovering
@@ -68,6 +80,30 @@ struct PillOverlay: View {
         }
         .animation(.easeInOut(duration: 0.2), value: appState.state)
         .frame(width: 192 + 80, height: 48 + 80)
+    }
+
+    // MARK: - Profile Switcher
+
+    private var profileSwitcher: some View {
+        Menu {
+            ForEach(appState.profiles) { profile in
+                Button {
+                    appState.selectedProfileId = profile.id
+                } label: {
+                    if profile.id == appState.selectedProfileId {
+                        Label(profile.name, systemImage: "checkmark")
+                    } else {
+                        Text(profile.name)
+                    }
+                }
+            }
+        } label: {
+            Text(appState.selectedProfile.abbreviation)
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
     }
 
     // MARK: - Drag Handle
