@@ -30,6 +30,11 @@ class AppState: ObservableObject {
         didSet { persistHistory() }
     }
 
+    // Configurable hotkey
+    @Published var hotkeyConfig: HotkeyConfig = HotkeyConfig.load() {
+        didSet { hotkeyManager?.updateConfig(hotkeyConfig) }
+    }
+
     // v0.1.0: Audio ducking
     @Published var duckMode: AudioDuckMode = .autoDuck {
         didSet { UserDefaults.standard.set(duckMode.rawValue, forKey: "duckMode") }
@@ -45,6 +50,7 @@ class AppState: ObservableObject {
     var pillController: PillWindowController?
     var hotkeyManager: HotkeyManager?
     var feedbackController: FeedbackWindowController?
+    var hotkeyRecorderController: HotkeyRecorderWindowController?
 
     let audioRecorder = AudioRecorder()
     let audioDucker = AudioDucker()
@@ -148,6 +154,13 @@ class AppState: ObservableObject {
     }
 
     @Published var feedbackType: IssueType = .bug
+
+    func showHotkeyRecorder() {
+        if hotkeyRecorderController == nil {
+            hotkeyRecorderController = HotkeyRecorderWindowController(appState: self)
+        }
+        hotkeyRecorderController?.show()
+    }
 
     func showFeedback(type: IssueType = .bug) {
         feedbackType = type

@@ -20,6 +20,8 @@ struct MenuBarView: View {
             Divider()
             providerSection
             Divider()
+            hotkeySection
+            Divider()
             audioSection
             Divider()
             historySection
@@ -67,6 +69,11 @@ struct MenuBarView: View {
             SecureField("OpenAI API Key", text: $appState.apiKey)
                 .textFieldStyle(.roundedBorder)
         }
+    }
+
+    @ViewBuilder
+    private var hotkeySection: some View {
+        HotkeyRecorderView(appState: appState)
     }
 
     @ViewBuilder
@@ -173,6 +180,7 @@ struct MenuBarView: View {
         if let bundleId = Bundle.main.bundleIdentifier {
             UserDefaults.standard.removePersistentDomain(forName: bundleId)
         }
+        HotkeyConfig.clearSaved()
         for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck"] {
             UserDefaults.standard.removeObject(forKey: key)
         }
