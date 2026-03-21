@@ -12,8 +12,16 @@ final class LocalTranscriber: TranscriptionProvider {
 
     private func resolveWhisperKit() async throws -> WhisperKit {
         if let whisperKit { return whisperKit }
-        let kit = try await WhisperKit()
+        let kit = try await WhisperKit(WhisperKitConfig(downloadBase: Self.modelCacheURL()))
         whisperKit = kit
         return kit
+    }
+
+    /// Stable model cache in Application Support — survives relaunches and rebuilds.
+    static func modelCacheURL() -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("Murmur/HuggingFace")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 }
