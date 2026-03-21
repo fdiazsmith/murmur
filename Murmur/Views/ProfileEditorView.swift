@@ -8,7 +8,19 @@ struct ProfileEditorView: View {
     @State private var name: String = ""
     @State private var prompt: String = ""
 
+    /// Whisper accepts ~224 tokens. ~4 chars/token = ~800 chars safe limit.
+    private static let charLimit = 800
+
     private var isEditing: Bool { profile != nil }
+    private var charCount: Int { prompt.count }
+    private var isOverLimit: Bool { charCount > Self.charLimit }
+
+    private var counterColor: Color {
+        let ratio = Double(charCount) / Double(Self.charLimit)
+        if ratio > 1.0 { return .red }
+        if ratio > 0.8 { return .orange }
+        return .secondary
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -18,14 +30,30 @@ struct ProfileEditorView: View {
             TextField("Name", text: $name)
                 .textFieldStyle(.roundedBorder)
 
-            Text("Context prompt (helps Whisper with vocabulary)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack {
+                Text("Context prompt")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(charCount) / \(Self.charLimit)")
+                    .font(.caption)
+                    .foregroundStyle(counterColor)
+            }
 
             TextEditor(text: $prompt)
                 .font(.body)
                 .frame(minHeight: 80)
-                .border(Color.secondary.opacity(0.3))
+                .border(isOverLimit ? Color.red.opacity(0.5) : Color.secondary.opacity(0.3))
+
+            if isOverLimit {
+                Text("Prompt too long — Whisper will truncate beyond ~224 tokens")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            } else {
+                Text("Helps Whisper with domain vocabulary, e.g. technical terms, names")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack {
                 Spacer()
@@ -40,7 +68,7 @@ struct ProfileEditorView: View {
             }
         }
         .padding()
-        .frame(width: 320)
+        .frame(width: 340)
         .onAppear {
             if let profile {
                 name = profile.name
