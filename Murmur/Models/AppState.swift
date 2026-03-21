@@ -99,11 +99,12 @@ class AppState: ObservableObject {
     }
 
     func stopRecordingAndTranscribe() {
+        // Always restore audio — safe even if not ducked
+        audioDucker.restore()
         guard state == .recording else {
             print("[Murmur] stopRecording skipped, state=\(state)")
             return
         }
-        audioDucker.restore()
 
         guard let fileURL = audioRecorder.stop() else {
             print("[Murmur] No audio file produced")
@@ -197,6 +198,8 @@ class AppState: ObservableObject {
         Task {
             try? await Task.sleep(for: .seconds(2))
             if state != .recording && state != .transcribing {
+                // Safety net: restore audio if still ducked
+                audioDucker.restore()
                 state = .idle
             }
         }

@@ -10,17 +10,23 @@ enum AudioDuckMode: String, CaseIterable {
 final class AudioDucker {
     private var previousVolume: Float32?
 
+    /// Whether audio is currently ducked.
+    var isDucked: Bool { previousVolume != nil }
+
     func duck(mode: AudioDuckMode, level: Float) {
         guard mode != .none else { return }
+        // Don't overwrite saved volume if already ducked
+        guard previousVolume == nil else { return }
         previousVolume = getSystemVolume()
         let target: Float32 = mode == .mute ? 0 : level
         setSystemVolume(target)
     }
 
+    /// Safe to call multiple times — no-op if not ducked.
     func restore() {
         guard let volume = previousVolume else { return }
-        setSystemVolume(volume)
         previousVolume = nil
+        setSystemVolume(volume)
     }
 
     private func getSystemVolume() -> Float32 {
