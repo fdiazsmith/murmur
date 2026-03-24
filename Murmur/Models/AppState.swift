@@ -94,10 +94,12 @@ class AppState: ObservableObject {
     }
 
     func startRecording() {
-        guard state == .idle else {
+        // Allow recording from idle, done, or error — only block if actively recording/transcribing
+        guard state != .recording, state != .transcribing else {
             print("[Murmur] startRecording skipped, state=\(state)")
             return
         }
+        state = .idle
         do {
             audioDucker.duck(mode: duckMode, level: duckLevel)
             try audioRecorder.start()

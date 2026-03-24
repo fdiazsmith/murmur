@@ -214,12 +214,10 @@ struct MenuBarView: View {
         for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck"] {
             UserDefaults.standard.removeObject(forKey: key)
         }
-        // Clean up model caches (old location + new persistent location)
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
         if let whisperCache = cacheDir?.appendingPathComponent("huggingface") {
             try? FileManager.default.removeItem(at: whisperCache)
         }
-        try? FileManager.default.removeItem(at: LocalTranscriber.modelCacheURL())
         NSApplication.shared.terminate(nil)
     }
 }

@@ -11,7 +11,10 @@ let package = Package(
         .executableTarget(
             name: "Murmur",
             dependencies: ["WhisperKit"],
-            path: "Murmur"
+            path: "Murmur",
+            resources: [
+                .copy("Resources"),
+            ]
         ),
     ]
 )

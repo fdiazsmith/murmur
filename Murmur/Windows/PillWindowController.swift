@@ -79,7 +79,14 @@ class PillWindowController {
         guard UserDefaults.standard.bool(forKey: "pillPositionCustom") else { return nil }
         let x = UserDefaults.standard.double(forKey: "pillPositionX")
         let y = UserDefaults.standard.double(forKey: "pillPositionY")
-        return NSPoint(x: x, y: y)
+        let point = NSPoint(x: x, y: y)
+        // Validate position is on a visible screen
+        let onScreen = NSScreen.screens.contains { $0.frame.contains(point) }
+        guard onScreen else {
+            clearPosition()
+            return nil
+        }
+        return point
     }
 
     static func clearPosition() {

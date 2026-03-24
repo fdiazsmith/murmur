@@ -98,17 +98,47 @@ final class HotkeyManager {
 
     // MARK: - Modifier-only hotkey (e.g. Fn+Shift)
 
-    private static func handleModifierOnly(type: CGEventType, flags: CGEventFlags) {
-        let matchesMods = config.matchesModifiers(flags)
+    /// Debounce timer for modifier-only release detection.
+    /// macOS generates intermediate flagsChanged events (e.g. Fn fires before Shift joins),
+    /// so we wait briefly before treating a mismatch as a real release.
+    private static var modifierReleaseWork: DispatchWorkItem?
+    private static let releaseDebounce: TimeInterval = 0.30
 
-        if type == .flagsChanged {
-            if matchesMods && !isHotkeyHeld {
-                isHotkeyHeld = true
-                Task { @MainActor in appState?.startRecording() }
-            } else if !matchesMods && isHotkeyHeld {
+    /// Check if all required modifiers are still held (inclusive — ignores extra modifiers)
+    private static func hasRequiredModifiers(_ flags: CGEventFlags) -> Bool {
+        (!config.control || flags.contains(.maskControl))
+            && (!config.shift || flags.contains(.maskShift))
+            && (!config.option || flags.contains(.maskAlternate))
+            && (!config.command || flags.contains(.maskCommand))
+            && (!config.fn || flags.contains(.maskSecondaryFn))
+    }
+
+    private static func handleModifierOnly(type: CGEventType, flags: CGEventFlags) {
+        guard type == .flagsChanged else { return }
+
+        let exactMatch = config.matchesModifiers(flags)
+        let stillHeld = hasRequiredModifiers(flags)
+
+        if exactMatch && !isHotkeyHeld {
+            // Exact combo pressed — start recording
+            modifierReleaseWork?.cancel()
+            modifierReleaseWork = nil
+            isHotkeyHeld = true
+            Task { @MainActor in appState?.startRecording() }
+        } else if stillHeld && isHotkeyHeld {
+            // Required modifiers still present (maybe extra flags) — stay recording
+            modifierReleaseWork?.cancel()
+            modifierReleaseWork = nil
+        } else if !stillHeld && isHotkeyHeld {
+            // A required modifier was released — debounce then stop
+            modifierReleaseWork?.cancel()
+            let work = DispatchWorkItem {
+                guard isHotkeyHeld else { return }
                 isHotkeyHeld = false
                 Task { @MainActor in appState?.stopRecordingAndTranscribe() }
             }
+            modifierReleaseWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + releaseDebounce, execute: work)
         }
     }
 
