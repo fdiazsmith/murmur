@@ -47,6 +47,18 @@ class AppState: ObservableObject {
         profiles.first(where: { $0.id == selectedProfileId }) ?? profiles.first ?? .general
     }
 
+    // Audio input device (nil = system default)
+    @Published var inputDeviceUID: String? = nil {
+        didSet {
+            if let uid = inputDeviceUID {
+                UserDefaults.standard.set(uid, forKey: "inputDeviceUID")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "inputDeviceUID")
+            }
+            audioRecorder.selectedDeviceUID = inputDeviceUID
+        }
+    }
+
     // v0.1.0: Audio ducking
     @Published var duckMode: AudioDuckMode = .autoDuck {
         didSet { UserDefaults.standard.set(duckMode.rawValue, forKey: "duckMode") }
@@ -68,6 +80,12 @@ class AppState: ObservableObject {
     let audioRecorder = AudioRecorder()
     let audioDucker = AudioDucker()
 
+    /// Cancellable reset timer — prevents stale timers from clobbering active sessions.
+    private var resetTask: Task<Void, Never>?
+
+    /// Max transcription retries on transient failure.
+    private static let maxRetries = 1
+
     private var currentProvider: any TranscriptionProvider {
         switch selectedProvider {
         case .local: return localTranscriber
@@ -75,7 +93,7 @@ class AppState: ObservableObject {
         }
     }
 
-    private lazy var localTranscriber = LocalTranscriber()
+    lazy var localTranscriber = LocalTranscriber()
 
     init() {
         if let saved = UserDefaults.standard.string(forKey: "selectedProvider"),
@@ -83,6 +101,9 @@ class AppState: ObservableObject {
             selectedProvider = provider
         }
         apiKey = UserDefaults.standard.string(forKey: "openaiAPIKey") ?? ""
+
+        inputDeviceUID = UserDefaults.standard.string(forKey: "inputDeviceUID")
+        audioRecorder.selectedDeviceUID = inputDeviceUID
 
         if let saved = UserDefaults.standard.string(forKey: "duckMode"),
            let mode = AudioDuckMode(rawValue: saved) {
@@ -99,6 +120,9 @@ class AppState: ObservableObject {
             print("[Murmur] startRecording skipped, state=\(state)")
             return
         }
+        // Cancel any pending reset timer so it can't clobber this new session
+        resetTask?.cancel()
+        resetTask = nil
         state = .idle
         do {
             audioDucker.duck(mode: duckMode, level: duckLevel)
@@ -122,8 +146,8 @@ class AppState: ObservableObject {
         }
 
         guard let fileURL = audioRecorder.stop() else {
-            print("[Murmur] No audio file produced")
-            state = .error("No audio recorded")
+            print("[Murmur] No audio file (too short or empty)")
+            state = .error("Recording too short")
             resetStateAfterDelay()
             return
         }
@@ -131,33 +155,79 @@ class AppState: ObservableObject {
         print("[Murmur] Recording stopped, file: \(fileURL.lastPathComponent)")
         state = .transcribing
         let provider = currentProvider
+        let prompt = selectedProfile.prompt
+        let providerName = selectedProvider.rawValue
+        print("[Murmur] Profile: \(selectedProfile.name), prompt: \(prompt.isEmpty ? "(empty)" : "\"\(prompt.prefix(40))\""), file: \(fileURL.path)")
 
         Task {
+            var lastError: Error?
+            for attempt in 0...Self.maxRetries {
+                if attempt > 0 {
+                    print("[Murmur] Retry \(attempt)/\(Self.maxRetries)...")
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+                do {
+                    print("[Murmur] Transcribing with \(providerName)...")
+                    let text = try await provider.transcribe(fileURL: fileURL, prompt: prompt)
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else {
+                        print("[Murmur] Empty transcription")
+                        lastError = TranscriptionError.emptyResult
+                        continue
+                    }
+                    print("[Murmur] Transcribed: \(trimmed.prefix(80))")
+                    lastTranscription = trimmed
+                    addToHistory(trimmed)
+                    PasteService.paste(trimmed)
+                    state = .done(trimmed)
+                    resetStateAfterDelay()
+                    return
+                } catch {
+                    print("[Murmur] Transcription error (attempt \(attempt)): \(error)")
+                    lastError = error
+                }
+            }
+            // All attempts failed — try debug fallback with empty prompt
+            print("[Murmur][DEBUG] Fallback: transcribing same file with empty prompt...")
             do {
-                print("[Murmur] Transcribing with \(selectedProvider.rawValue)...")
-                let text = try await provider.transcribe(fileURL: fileURL, prompt: selectedProfile.prompt)
-                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    print("[Murmur] Empty transcription")
-                    state = .error("Empty transcription")
+                let fallback = try await localTranscriber.transcribe(fileURL: fileURL, prompt: "")
+                let trimmed = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    print("[Murmur][DEBUG] Fallback succeeded: \(trimmed.prefix(80))")
+                    lastTranscription = trimmed
+                    addToHistory(trimmed)
+                    PasteService.paste(trimmed)
+                    state = .done(trimmed)
                     resetStateAfterDelay()
                     return
                 }
-                print("[Murmur] Transcribed: \(text.prefix(80))")
-                lastTranscription = text
-                addToHistory(text)
-                PasteService.paste(text)
-                state = .done(text)
-                resetStateAfterDelay()
+                print("[Murmur][DEBUG] Fallback also empty")
             } catch {
-                print("[Murmur] Transcription error: \(error)")
-                state = .error("Transcription failed: \(error.localizedDescription)")
-                resetStateAfterDelay()
+                print("[Murmur][DEBUG] Fallback error: \(error)")
             }
+            let message = lastError?.localizedDescription ?? "Unknown error"
+            state = .error("Transcription failed: \(message)")
+            resetStateAfterDelay()
         }
+    }
+
+    private enum TranscriptionError: Error, LocalizedError {
+        case emptyResult
+        var errorDescription: String? { "Empty transcription" }
     }
 
     func clearHistory() {
         history.removeAll()
+    }
+
+    func resetPillPosition() {
+        PillWindowController.clearPosition()
+        if let panel = pillController?.panel, let screen = NSScreen.main {
+            let visibleFrame = screen.visibleFrame
+            let x = visibleFrame.maxX - panel.frame.width - 20 + 40
+            let y = visibleFrame.minY + 80 - 40
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+        }
     }
 
     func checkForUpdates() {
@@ -215,6 +285,76 @@ class AppState: ObservableObject {
         feedbackController?.show()
     }
 
+    // MARK: - Debug
+
+    /// Records 3 seconds to Desktop and opens the file for inspection.
+    func debugCapture() {
+        state = .idle
+        do {
+            try audioRecorder.start()
+            state = .recording
+            print("[Murmur][DEBUG] Capture started — recording 3s...")
+        } catch {
+            print("[Murmur][DEBUG] Capture failed to start: \(error)")
+            state = .error("Debug capture failed: \(error.localizedDescription)")
+            return
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            guard let tmpURL = audioRecorder.stop() else {
+                print("[Murmur][DEBUG] No audio file produced")
+                state = .error("Debug: no audio captured")
+                resetStateAfterDelay()
+                return
+            }
+            let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
+            let dest = desktop.appendingPathComponent("murmur_debug.wav")
+            try? FileManager.default.removeItem(at: dest)
+            do {
+                try FileManager.default.copyItem(at: tmpURL, to: dest)
+                let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
+                let size = (attrs?[.size] as? UInt64) ?? 0
+                print("[Murmur][DEBUG] Saved \(size) bytes → \(dest.path)")
+                NSWorkspace.shared.open(dest)
+                state = .done("Debug: saved to Desktop")
+            } catch {
+                print("[Murmur][DEBUG] Copy failed: \(error)")
+                state = .error("Debug: \(error.localizedDescription)")
+            }
+            resetStateAfterDelay()
+        }
+    }
+
+    /// Transcribes a known-good WAV file to test WhisperKit in isolation.
+    func debugTranscribe() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.wav, .audio]
+        panel.message = "Select a WAV file to transcribe"
+        panel.begin { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                self.state = .transcribing
+                print("[Murmur][DEBUG] Transcribing: \(url.lastPathComponent)")
+                do {
+                    let text = try await self.localTranscriber.transcribe(fileURL: url, prompt: "")
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty {
+                        print("[Murmur][DEBUG] WhisperKit returned empty text")
+                        self.state = .error("Debug: empty transcription")
+                    } else {
+                        print("[Murmur][DEBUG] Result: \(trimmed)")
+                        self.lastTranscription = trimmed
+                        self.state = .done(trimmed)
+                    }
+                } catch {
+                    print("[Murmur][DEBUG] Transcription error: \(error)")
+                    self.state = .error("Debug: \(error.localizedDescription)")
+                }
+                self.resetStateAfterDelay()
+            }
+        }
+    }
+
     // MARK: - Private
 
     private func addToHistory(_ text: String) {
@@ -239,10 +379,11 @@ class AppState: ObservableObject {
     }
 
     private func resetStateAfterDelay() {
-        Task {
+        resetTask?.cancel()
+        resetTask = Task {
             try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
             if state != .recording && state != .transcribing {
-                // Safety net: restore audio if still ducked
                 audioDucker.restore()
                 state = .idle
             }

@@ -30,6 +30,14 @@ struct MenuBarView: View {
             Divider()
             feedbackSection
             Divider()
+            #if DEBUG
+            Divider()
+            debugSection
+            #endif
+            Divider()
+            Button("Reset Pill Position") {
+                appState.resetPillPosition()
+            }
             Button("Uninstall Murmur...") {
                 showUninstallConfirmation = true
             }
@@ -106,6 +114,13 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var audioSection: some View {
+        let devices = AudioInputDevice.available()
+        Picker("Microphone", selection: $appState.inputDeviceUID) {
+            Text("System Default").tag(String?.none)
+            ForEach(devices) { device in
+                Text(device.name).tag(Optional(device.uid))
+            }
+        }
         Picker("During recording", selection: $appState.duckMode) {
             ForEach(AudioDuckMode.allCases, id: \.self) { mode in
                 Text(mode.rawValue).tag(mode)
@@ -166,6 +181,19 @@ struct MenuBarView: View {
         Button("Report Bug...") { appState.showFeedback(type: .bug) }
         Button("Request Feature...") { appState.showFeedback(type: .feature) }
     }
+
+    #if DEBUG
+    @ViewBuilder
+    private var debugSection: some View {
+        Text("Debug").font(.caption).foregroundStyle(.secondary)
+        Button("Test Capture (3s → Desktop)") {
+            appState.debugCapture()
+        }
+        Button("Transcribe WAV File...") {
+            appState.debugTranscribe()
+        }
+    }
+    #endif
 
     // MARK: - Helpers
 
