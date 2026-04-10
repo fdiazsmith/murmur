@@ -4,23 +4,31 @@ import WhisperKit
 final class LocalTranscriber: TranscriptionProvider {
     private var whisperKit: WhisperKit?
 
+    /// Whisper model variant to use (e.g. "tiny.en", "base", "small.en").
+    var modelVariant: String?
+
     /// Called on main thread with (fractionCompleted 0-1, status string).
     var onProgress: ((Double, String) -> Void)?
 
     var isReady: Bool { whisperKit != nil }
 
+    /// Force re-initialization on next transcription (e.g. after model change).
+    func invalidate() {
+        whisperKit = nil
+    }
+
     func transcribe(fileURL: URL, prompt: String) async throws -> String {
         let kit = try await resolveWhisperKit()
 
         do {
-            let results: [TranscriptionResult]
+            var options = DecodingOptions(
+                temperatureFallbackCount: 2,
+                chunkingStrategy: .vad
+            )
             if !prompt.isEmpty, let tokenizer = kit.tokenizer {
-                let tokens = tokenizer.encode(text: prompt)
-                let options = DecodingOptions(promptTokens: tokens)
-                results = try await kit.transcribe(audioPath: fileURL.path, decodeOptions: options)
-            } else {
-                results = try await kit.transcribe(audioPath: fileURL.path)
+                options.promptTokens = tokenizer.encode(text: prompt)
             }
+            let results = try await kit.transcribe(audioPath: fileURL.path, decodeOptions: options)
             return results.compactMap(\.text).joined(separator: " ").trimmingCharacters(in: .whitespaces)
         } catch {
             print("[Murmur] WhisperKit error, will reinit next call: \(error)")
@@ -44,8 +52,9 @@ final class LocalTranscriber: TranscriptionProvider {
 
         let progressCb = self.onProgress
         let config = WhisperKitConfig(
+            model: modelVariant,
             verbose: false,
-            prewarm: true,
+            prewarm: false,
             load: true,
             download: true
         )

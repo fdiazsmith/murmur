@@ -24,6 +24,7 @@ class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(apiKey, forKey: "openaiAPIKey") }
     }
     @Published var lastTranscription: String = ""
+    @Published var recordingElapsedTime: TimeInterval = 0
 
     // v0.1.0: Transcription history
     @Published var history: [TranscriptionEntry] = [] {
@@ -59,6 +60,18 @@ class AppState: ObservableObject {
         }
     }
 
+    // Whisper model variant (local only)
+    @Published var modelVariant: String = "base" {
+        didSet {
+            UserDefaults.standard.set(modelVariant, forKey: "whisperModelVariant")
+            // Force re-init on next transcription so the new model loads
+            localTranscriber.modelVariant = modelVariant
+            localTranscriber.invalidate()
+        }
+    }
+
+    static let availableModels = ["tiny", "tiny.en", "base", "base.en", "small", "small.en"]
+
     // v0.1.0: Audio ducking
     @Published var duckMode: AudioDuckMode = .autoDuck {
         didSet { UserDefaults.standard.set(duckMode.rawValue, forKey: "duckMode") }
@@ -93,7 +106,11 @@ class AppState: ObservableObject {
         }
     }
 
-    lazy var localTranscriber = LocalTranscriber()
+    lazy var localTranscriber: LocalTranscriber = {
+        let t = LocalTranscriber()
+        t.modelVariant = modelVariant
+        return t
+    }()
 
     init() {
         if let saved = UserDefaults.standard.string(forKey: "selectedProvider"),
@@ -104,6 +121,8 @@ class AppState: ObservableObject {
 
         inputDeviceUID = UserDefaults.standard.string(forKey: "inputDeviceUID")
         audioRecorder.selectedDeviceUID = inputDeviceUID
+
+        modelVariant = UserDefaults.standard.string(forKey: "whisperModelVariant") ?? "base"
 
         if let saved = UserDefaults.standard.string(forKey: "duckMode"),
            let mode = AudioDuckMode(rawValue: saved) {
@@ -126,7 +145,17 @@ class AppState: ObservableObject {
         state = .idle
         do {
             audioDucker.duck(mode: duckMode, level: duckLevel)
+            audioRecorder.onElapsedTimeUpdate = { [weak self] elapsed in
+                Task { @MainActor in self?.recordingElapsedTime = elapsed }
+            }
+            audioRecorder.onAutoStop = { [weak self] in
+                Task { @MainActor in
+                    print("[Murmur] Auto-stop: max duration reached")
+                    self?.stopRecordingAndTranscribe()
+                }
+            }
             try audioRecorder.start()
+            recordingElapsedTime = 0
             state = .recording
             print("[Murmur] Recording started")
         } catch {

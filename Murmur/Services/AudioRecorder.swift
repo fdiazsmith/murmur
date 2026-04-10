@@ -52,8 +52,10 @@ struct AudioInputDevice: Identifiable, Hashable {
 final class AudioRecorder {
     private var engine: AVAudioEngine?
     private var outputFile: AVAudioFile?
+    private var converter: AVAudioConverter?
     private var tempFileURL: URL?
     private var recordingStartTime: Date?
+    private var durationTimer: Timer?
 
     /// UID of the selected input device. nil = system default.
     var selectedDeviceUID: String?
@@ -61,7 +63,21 @@ final class AudioRecorder {
     /// Saved system default to restore after recording.
     private var savedDefaultDevice: AudioDeviceID?
 
+    /// 16kHz mono — WhisperKit's native format, skips internal resampling.
+    private static let targetSampleRate: Double = 16000
+    private static let targetChannels: AVAudioChannelCount = 1
+
     static let minimumDuration: TimeInterval = 0.3
+    static let maxDuration: TimeInterval = 300 // 5 minutes
+
+    /// Current elapsed recording time, updated every 0.5s.
+    private(set) var elapsedTime: TimeInterval = 0
+
+    /// Called on each timer tick with the elapsed time.
+    var onElapsedTimeUpdate: ((TimeInterval) -> Void)?
+
+    /// Called when recording auto-stops due to max duration.
+    var onAutoStop: (() -> Void)?
 
     var isRunning: Bool { engine?.isRunning ?? false }
 
@@ -88,22 +104,34 @@ final class AudioRecorder {
             throw AudioRecorderError.invalidInputFormat
         }
 
-        // Write in native mic format — WhisperKit resamples to 16kHz internally
+        // Write in 16kHz mono — WhisperKit skips resampling, files are ~12x smaller
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("wav")
         tempFileURL = url
 
         let writeFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                        sampleRate: inputFormat.sampleRate,
-                                        channels: inputFormat.channelCount,
+                                        sampleRate: Self.targetSampleRate,
+                                        channels: Self.targetChannels,
                                         interleaved: false)!
         outputFile = try AVAudioFile(forWriting: url,
                                      settings: writeFormat.settings,
                                      commonFormat: .pcmFormatFloat32,
                                      interleaved: false)
 
+        // Set up converter from mic format to 16kHz mono
+        let needsConversion = inputFormat.sampleRate != Self.targetSampleRate
+                              || inputFormat.channelCount != Self.targetChannels
+        if needsConversion {
+            guard let conv = AVAudioConverter(from: inputFormat, to: writeFormat) else {
+                throw AudioRecorderError.converterCreationFailed
+            }
+            conv.sampleRateConverterQuality = AVAudioQuality.medium.rawValue
+            converter = conv
+        }
+
         var tapCount = 0
+        let conv = converter
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             guard let self, let file = self.outputFile else {
                 if tapCount == 0 { print("[Murmur] TAP: fired but self/file is nil") }
@@ -111,10 +139,24 @@ final class AudioRecorder {
                 return
             }
             do {
-                try file.write(from: buffer)
+                if let conv {
+                    // Downsample to 16kHz mono
+                    let ratio = Self.targetSampleRate / inputFormat.sampleRate
+                    let outputFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+                    guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: writeFormat, frameCapacity: outputFrames) else { return }
+                    var error: NSError?
+                    conv.convert(to: convertedBuffer, error: &error) { _, outStatus in
+                        outStatus.pointee = .haveData
+                        return buffer
+                    }
+                    if let error { print("[Murmur] TAP convert error: \(error)"); return }
+                    try file.write(from: convertedBuffer)
+                } else {
+                    try file.write(from: buffer)
+                }
                 tapCount += 1
                 if tapCount == 1 {
-                    print("[Murmur] TAP: first buffer written, frames=\(buffer.frameLength)")
+                    print("[Murmur] TAP: first buffer written, frames=\(buffer.frameLength), converting=\(conv != nil)")
                 }
             } catch {
                 print("[Murmur] TAP write error: \(error)")
@@ -125,6 +167,19 @@ final class AudioRecorder {
         try newEngine.start()
         engine = newEngine
         recordingStartTime = Date()
+        elapsedTime = 0
+
+        // Update elapsed time every 0.5s, auto-stop at max duration
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, let start = self.recordingStartTime else { return }
+            self.elapsedTime = Date().timeIntervalSince(start)
+            self.onElapsedTimeUpdate?(self.elapsedTime)
+            if self.elapsedTime >= Self.maxDuration {
+                self.onAutoStop?()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        durationTimer = timer
     }
 
     func stop() -> URL? {
@@ -141,9 +196,6 @@ final class AudioRecorder {
 
         guard let url = tempFileURL else { return nil }
 
-        // Small delay to ensure AVAudioFile is fully flushed after engine stop
-        Thread.sleep(forTimeInterval: 0.05)
-
         let minFileSize: UInt64 = 5000
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let fileSize = attrs[.size] as? UInt64,
@@ -157,12 +209,15 @@ final class AudioRecorder {
     }
 
     private func tearDown() {
+        durationTimer?.invalidate()
+        durationTimer = nil
         if let engine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
         engine = nil
         outputFile = nil
+        converter = nil
         recordingStartTime = nil
         // Restore previous system default input if we changed it
         if let saved = savedDefaultDevice {
