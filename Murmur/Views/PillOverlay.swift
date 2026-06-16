@@ -37,6 +37,18 @@ struct PillOverlay: View {
                                 .progressViewStyle(.circular)
                                 .scaleEffect(0.8)
                                 .colorInvert()
+                        } else if appState.state == .recording {
+                            VStack(spacing: 2) {
+                                pillIcon
+                                    .renderingMode(.template)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(height: 16)
+                                    .foregroundStyle(.white)
+                                Text(formattedElapsed)
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.9))
+                            }
                         } else {
                             pillIcon
                                 .renderingMode(.template)
@@ -149,13 +161,25 @@ struct PillOverlay: View {
         return Image(systemName: "mic.fill")
     }
 
+    private var formattedElapsed: String {
+        let t = Int(appState.recordingElapsedTime)
+        return String(format: "%d:%02d", t / 60, t % 60)
+    }
+
+    private var durationFraction: Double {
+        appState.recordingElapsedTime / AudioRecorder.maxDuration
+    }
+
     private var backgroundColor: Color {
         switch appState.state {
-        case .idle: .gray.opacity(0.8)
-        case .recording: .red
-        case .transcribing: .orange
-        case .done: .green
-        case .error: .red.opacity(0.7)
+        case .idle: return .gray.opacity(0.8)
+        case .recording:
+            if durationFraction >= 0.95 { return .red }
+            if durationFraction >= 0.80 { return .orange }
+            return .red
+        case .transcribing: return .orange
+        case .done: return .green
+        case .error: return .red.opacity(0.7)
         }
     }
 

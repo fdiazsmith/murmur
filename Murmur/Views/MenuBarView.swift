@@ -75,6 +75,13 @@ struct MenuBarView: View {
                 Text(type.rawValue).tag(type)
             }
         }
+        if appState.selectedProvider == .local {
+            Picker("Model", selection: $appState.modelVariant) {
+                ForEach(AppState.availableModels, id: \.self) { model in
+                    Text(model).tag(model)
+                }
+            }
+        }
         if appState.selectedProvider == .cloud {
             SecureField("OpenAI API Key", text: $appState.apiKey)
                 .textFieldStyle(.roundedBorder)
@@ -239,7 +246,7 @@ struct MenuBarView: View {
         HotkeyConfig.clearSaved()
         PillWindowController.clearPosition()
         Profile.clearSaved()
-        for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck"] {
+        for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck", "whisperModelVariant"] {
             UserDefaults.standard.removeObject(forKey: key)
         }
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
