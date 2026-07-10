@@ -76,6 +76,9 @@ final class AudioRecorder {
     /// Called on each timer tick with the elapsed time.
     var onElapsedTimeUpdate: ((TimeInterval) -> Void)?
 
+    /// Called per tap buffer (audio thread) with the normalized mic level (0...1).
+    var onLevelUpdate: ((Float) -> Void)?
+
     /// Called when recording auto-stops due to max duration.
     var onAutoStop: (() -> Void)?
 
@@ -133,6 +136,18 @@ final class AudioRecorder {
         var tapCount = 0
         let conv = converter
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+            if let self, let onLevel = self.onLevelUpdate,
+               let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 {
+                var sum: Float = 0
+                for frame in 0..<Int(buffer.frameLength) {
+                    let sample = channel[frame]
+                    sum += sample * sample
+                }
+                let rms = sqrt(sum / Float(buffer.frameLength))
+                let db = 20 * log10(max(rms, 1e-7))
+                // Map speech range (-50dB quiet ... -8dB loud) to 0...1
+                onLevel(min(max((db + 50) / 42, 0), 1))
+            }
             guard let self, let file = self.outputFile else {
                 if tapCount == 0 { print("[Murmur] TAP: fired but self/file is nil") }
                 tapCount += 1

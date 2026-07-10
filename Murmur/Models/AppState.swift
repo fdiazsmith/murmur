@@ -26,6 +26,9 @@ class AppState: ObservableObject {
     @Published var lastTranscription: String = ""
     @Published var recordingElapsedTime: TimeInterval = 0
 
+    /// Live mic input level (0...1) while recording — drives the pill waveform.
+    @Published var audioLevel: Float = 0
+
     // v0.1.0: Transcription history
     @Published var history: [TranscriptionEntry] = [] {
         didSet { persistHistory() }
@@ -148,6 +151,9 @@ class AppState: ObservableObject {
             audioRecorder.onElapsedTimeUpdate = { [weak self] elapsed in
                 Task { @MainActor in self?.recordingElapsedTime = elapsed }
             }
+            audioRecorder.onLevelUpdate = { [weak self] level in
+                Task { @MainActor in self?.audioLevel = level }
+            }
             audioRecorder.onAutoStop = { [weak self] in
                 Task { @MainActor in
                     print("[Murmur] Auto-stop: max duration reached")
@@ -169,6 +175,7 @@ class AppState: ObservableObject {
     func stopRecordingAndTranscribe() {
         // Always restore audio — safe even if not ducked
         audioDucker.restore()
+        audioLevel = 0
         guard state == .recording else {
             print("[Murmur] stopRecording skipped, state=\(state)")
             return

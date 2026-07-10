@@ -12,8 +12,8 @@ class PillWindowController {
     private let appState: AppState
 
     private let inset: CGFloat = 40
-    private let pillWidth: CGFloat = 192
-    private let pillHeight: CGFloat = 48
+    private let pillWidth: CGFloat = PillOverlay.pillWidth
+    private let pillHeight: CGFloat = PillOverlay.pillHeight
 
     init(appState: AppState) {
         self.appState = appState
