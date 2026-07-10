@@ -21,15 +21,15 @@ final class LocalTranscriber: TranscriptionProvider {
         let kit = try await resolveWhisperKit()
 
         do {
-            var options = DecodingOptions(
-                temperatureFallbackCount: 2,
-                chunkingStrategy: .vad
-            )
+            // Keep WhisperKit's default temperature fallback ladder (5): it is
+            // whisper's built-in escape from repetition loops, re-decoding a
+            // chunk at higher temperature when it detects a bad result.
+            var options = DecodingOptions(chunkingStrategy: .vad)
             if !prompt.isEmpty, let tokenizer = kit.tokenizer {
                 options.promptTokens = tokenizer.encode(text: prompt)
             }
             let results = try await kit.transcribe(audioPath: fileURL.path, decodeOptions: options)
-            return results.compactMap(\.text).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            return TranscriptMerger.merge(results.compactMap(\.text))
         } catch {
             print("[Murmur] WhisperKit error, will reinit next call: \(error)")
             whisperKit = nil

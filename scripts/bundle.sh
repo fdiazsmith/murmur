@@ -21,8 +21,18 @@ mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 
 # Copy binary (SPM uses arch-specific path)
-BIN_PATH="$(swift build -c release --show-bin-path)/${APP_NAME}"
-cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/"
+BIN_DIR="$(swift build -c release --show-bin-path)"
+cp "${BIN_DIR}/${APP_NAME}" "${APP_DIR}/Contents/MacOS/"
+
+# Copy SwiftPM resource bundles. Bundle.module resolves to
+# Bundle.main.bundleURL/<Pkg>_<Target>.bundle, which for a .app is the app
+# root — so the bundles must sit beside Contents, not inside Resources.
+echo "==> Copying resource bundles..."
+shopt -s nullglob
+for bundle in "${BIN_DIR}"/*.bundle; do
+    cp -R "${bundle}" "${APP_DIR}/"
+done
+shopt -u nullglob
 
 # Info.plist for the app bundle
 cat > "${APP_DIR}/Contents/Info.plist" << PLIST

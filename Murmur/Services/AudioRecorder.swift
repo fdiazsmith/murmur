@@ -140,17 +140,31 @@ final class AudioRecorder {
             }
             do {
                 if let conv {
-                    // Downsample to 16kHz mono
+                    // Downsample to 16kHz mono. Round capacity up (+ headroom) so the
+                    // converter never needs an extra input pull just to fit output.
                     let ratio = Self.targetSampleRate / inputFormat.sampleRate
-                    let outputFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+                    let outputFrames = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio)) + 32
                     guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: writeFormat, frameCapacity: outputFrames) else { return }
                     var error: NSError?
+                    // Feed this tap buffer exactly once. AVAudioConverter may call the
+                    // input block multiple times per convert() during resampling; without
+                    // this guard it re-consumes the same buffer and duplicates audio.
+                    // .noDataNow (not .endOfStream, which would kill the converter for
+                    // later tap callbacks) signals no more input this cycle.
+                    var consumed = false
                     conv.convert(to: convertedBuffer, error: &error) { _, outStatus in
+                        if consumed {
+                            outStatus.pointee = .noDataNow
+                            return nil
+                        }
+                        consumed = true
                         outStatus.pointee = .haveData
                         return buffer
                     }
                     if let error { print("[Murmur] TAP convert error: \(error)"); return }
-                    try file.write(from: convertedBuffer)
+                    if convertedBuffer.frameLength > 0 {
+                        try file.write(from: convertedBuffer)
+                    }
                 } else {
                     try file.write(from: buffer)
                 }
