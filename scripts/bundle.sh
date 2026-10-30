@@ -24,13 +24,13 @@ mkdir -p "${APP_DIR}/Contents/Resources"
 BIN_DIR="$(swift build -c release --show-bin-path)"
 cp "${BIN_DIR}/${APP_NAME}" "${APP_DIR}/Contents/MacOS/"
 
-# Copy SwiftPM resource bundles. Bundle.module resolves to
-# Bundle.main.bundleURL/<Pkg>_<Target>.bundle, which for a .app is the app
-# root — so the bundles must sit beside Contents, not inside Resources.
+# Copy SwiftPM resource bundles. Bundle.module checks
+# Bundle.main.resourceURL (Contents/Resources) first. They can't sit at the
+# app root: codesign rejects unsealed contents there.
 echo "==> Copying resource bundles..."
 shopt -s nullglob
 for bundle in "${BIN_DIR}"/*.bundle; do
-    cp -R "${bundle}" "${APP_DIR}/"
+    cp -R "${bundle}" "${APP_DIR}/Contents/Resources/"
 done
 shopt -u nullglob
 
