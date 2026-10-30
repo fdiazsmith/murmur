@@ -78,8 +78,13 @@ struct MenuBarView: View {
         if appState.selectedProvider == .local {
             Picker("Model", selection: $appState.modelVariant) {
                 ForEach(AppState.availableModels, id: \.self) { model in
-                    Text(model).tag(model)
+                    Text(WhisperModelCatalog.label(for: model)).tag(model)
                 }
+            }
+            if !appState.modelStatus.isEmpty {
+                Text("Model: \(appState.modelStatus)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         if appState.selectedProvider == .cloud {

@@ -18,7 +18,10 @@ enum TranscriptionProviderType: String, CaseIterable {
 class AppState: ObservableObject {
     @Published var state: AppRecordingState = .idle
     @Published var selectedProvider: TranscriptionProviderType = .local {
-        didSet { UserDefaults.standard.set(selectedProvider.rawValue, forKey: "selectedProvider") }
+        didSet {
+            UserDefaults.standard.set(selectedProvider.rawValue, forKey: "selectedProvider")
+            if selectedProvider == .local { warmUpLocalModel() }
+        }
     }
     @Published var apiKey: String = "" {
         didSet { UserDefaults.standard.set(apiKey, forKey: "openaiAPIKey") }
@@ -64,16 +67,29 @@ class AppState: ObservableObject {
     }
 
     // Whisper model variant (local only)
-    @Published var modelVariant: String = "base" {
+    @Published var modelVariant: String = WhisperModelCatalog.defaultVariant {
         didSet {
-            UserDefaults.standard.set(modelVariant, forKey: "whisperModelVariant")
-            // Force re-init on next transcription so the new model loads
+            guard modelVariant != oldValue else { return }
+            UserDefaults.standard.set(modelVariant, forKey: Self.modelVariantKey)
+            // Drop the old model and load the new one now, so the first
+            // dictation after a switch doesn't pay the (large-model) load.
             localTranscriber.modelVariant = modelVariant
             localTranscriber.invalidate()
+            warmUpLocalModel()
         }
     }
 
-    static let availableModels = ["tiny", "tiny.en", "base", "base.en", "small", "small.en"]
+    static let availableModels = WhisperModelCatalog.variants
+
+    /// Local model load/download status from `LocalTranscriber.onProgress`
+    /// ("Loading model…", "Downloading model… 40%", "Ready"); shown under the
+    /// model picker.
+    @Published var modelStatus: String = ""
+
+    private static let modelVariantKey = "whisperModelVariant"
+    /// Set once the base -> large-v3 turbo default upgrade has run, so a user
+    /// who later picks a smaller model deliberately keeps it.
+    private static let modelMigrationKey = "didMigrateModelToLargeV3Turbo"
 
     // v0.1.0: Audio ducking
     @Published var duckMode: AudioDuckMode = .autoDuck {
@@ -99,9 +115,6 @@ class AppState: ObservableObject {
     /// Cancellable reset timer — prevents stale timers from clobbering active sessions.
     private var resetTask: Task<Void, Never>?
 
-    /// Max transcription retries on transient failure.
-    private static let maxRetries = 1
-
     private var currentProvider: any TranscriptionProvider {
         switch selectedProvider {
         case .local: return localTranscriber
@@ -112,6 +125,9 @@ class AppState: ObservableObject {
     lazy var localTranscriber: LocalTranscriber = {
         let t = LocalTranscriber()
         t.modelVariant = modelVariant
+        t.onProgress = { [weak self] _, status in
+            self?.modelStatus = status
+        }
         return t
     }()
 
@@ -125,7 +141,15 @@ class AppState: ObservableObject {
         inputDeviceUID = UserDefaults.standard.string(forKey: "inputDeviceUID")
         audioRecorder.selectedDeviceUID = inputDeviceUID
 
-        modelVariant = UserDefaults.standard.string(forKey: "whisperModelVariant") ?? "base"
+        // Property observers don't fire in init, so persist the resolved
+        // variant here (it may differ from the stored one after migration).
+        let defaults = UserDefaults.standard
+        modelVariant = WhisperModelCatalog.resolveStoredVariant(
+            defaults.string(forKey: Self.modelVariantKey),
+            migrationDone: defaults.bool(forKey: Self.modelMigrationKey)
+        )
+        defaults.set(modelVariant, forKey: Self.modelVariantKey)
+        defaults.set(true, forKey: Self.modelMigrationKey)
 
         if let saved = UserDefaults.standard.string(forKey: "duckMode"),
            let mode = AudioDuckMode(rawValue: saved) {
@@ -134,6 +158,19 @@ class AppState: ObservableObject {
         duckLevel = UserDefaults.standard.object(forKey: "duckLevel") as? Float ?? 0.2
 
         loadHistory()
+
+        // Load the model at launch so the first dictation isn't the one that
+        // waits for it (large-v3 turbo takes seconds to load, minutes to
+        // specialize after an OS update).
+        warmUpLocalModel()
+    }
+
+    /// Start loading the local model in the background. No-op when the cloud
+    /// provider is selected or the model is already loaded / loading.
+    func warmUpLocalModel() {
+        guard selectedProvider == .local else { return }
+        let transcriber = localTranscriber
+        Task { await transcriber.warmup() }
     }
 
     func startRecording() {
@@ -196,50 +233,39 @@ class AppState: ObservableObject {
         print("[Murmur] Profile: \(selectedProfile.name), prompt: \(prompt.isEmpty ? "(empty)" : "\"\(prompt.prefix(40))\""), file: \(fileURL.path)")
 
         Task {
+            let prompts = TranscriptionRetryLadder.prompts(for: prompt)
+            var attempt: Int? = 0
             var lastError: Error?
-            for attempt in 0...Self.maxRetries {
-                if attempt > 0 {
-                    print("[Murmur] Retry \(attempt)/\(Self.maxRetries)...")
+            while let index = attempt {
+                let attemptPrompt = prompts[index]
+                if index > 0 {
+                    print("[Murmur] Retry \(index)/\(prompts.count - 1)\(attemptPrompt.isEmpty && !prompt.isEmpty ? " without prompt" : "")...")
                     try? await Task.sleep(for: .milliseconds(300))
                 }
+                var emptyResult = false
                 do {
                     print("[Murmur] Transcribing with \(providerName)...")
-                    let text = try await provider.transcribe(fileURL: fileURL, prompt: prompt)
+                    let text = try await provider.transcribe(fileURL: fileURL, prompt: attemptPrompt)
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty else {
+                    if trimmed.isEmpty {
                         print("[Murmur] Empty transcription")
                         lastError = TranscriptionError.emptyResult
-                        continue
+                        emptyResult = true
+                    } else {
+                        let tail = trimmed.count > 160 ? " […] \(trimmed.suffix(80))" : ""
+                        print("[Murmur] Transcribed \(trimmed.count) chars: \(trimmed.prefix(80))\(tail)")
+                        lastTranscription = trimmed
+                        addToHistory(trimmed)
+                        PasteService.paste(trimmed)
+                        state = .done(trimmed)
+                        resetStateAfterDelay()
+                        return
                     }
-                    print("[Murmur] Transcribed: \(trimmed.prefix(80))")
-                    lastTranscription = trimmed
-                    addToHistory(trimmed)
-                    PasteService.paste(trimmed)
-                    state = .done(trimmed)
-                    resetStateAfterDelay()
-                    return
                 } catch {
-                    print("[Murmur] Transcription error (attempt \(attempt)): \(error)")
+                    print("[Murmur] Transcription error (attempt \(index)): \(error)")
                     lastError = error
                 }
-            }
-            // All attempts failed — try debug fallback with empty prompt
-            print("[Murmur][DEBUG] Fallback: transcribing same file with empty prompt...")
-            do {
-                let fallback = try await localTranscriber.transcribe(fileURL: fileURL, prompt: "")
-                let trimmed = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    print("[Murmur][DEBUG] Fallback succeeded: \(trimmed.prefix(80))")
-                    lastTranscription = trimmed
-                    addToHistory(trimmed)
-                    PasteService.paste(trimmed)
-                    state = .done(trimmed)
-                    resetStateAfterDelay()
-                    return
-                }
-                print("[Murmur][DEBUG] Fallback also empty")
-            } catch {
-                print("[Murmur][DEBUG] Fallback error: \(error)")
+                attempt = TranscriptionRetryLadder.nextAttempt(after: index, in: prompts, emptyResult: emptyResult)
             }
             let message = lastError?.localizedDescription ?? "Unknown error"
             state = .error("Transcription failed: \(message)")
@@ -424,5 +450,29 @@ class AppState: ObservableObject {
                 state = .idle
             }
         }
+    }
+}
+
+/// Retry plan for one dictation. Each attempt re-runs the whole recording, so
+/// with a large local model the ladder is kept short:
+///
+/// - with a profile prompt: prompt, prompt again, then no prompt — a prompt
+///   can steer Whisper into empty or garbage output, so the last rung drops it;
+/// - without one: a single retry.
+///
+/// A thrown error retries the same prompt (it may be transient). An empty
+/// result does not: decoding is deterministic, so the same prompt on the same
+/// audio would just reproduce it — skip to the next different prompt instead.
+enum TranscriptionRetryLadder {
+    static func prompts(for prompt: String) -> [String] {
+        prompt.isEmpty ? ["", ""] : [prompt, prompt, ""]
+    }
+
+    /// Index of the next attempt after attempt `index` failed, or nil to give up.
+    static func nextAttempt(after index: Int, in prompts: [String], emptyResult: Bool) -> Int? {
+        let next = index + 1
+        guard next < prompts.count else { return nil }
+        guard emptyResult else { return next }
+        return prompts[next...].firstIndex(where: { $0 != prompts[index] })
     }
 }
