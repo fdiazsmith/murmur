@@ -85,6 +85,7 @@ final class LocalTranscriber: TranscriptionProvider {
                 }
                 options.promptTokens = tokens.isEmpty ? nil : tokens
             }
+            let start = Date()
             logCollector.beginRun()
             let audio = try AudioProcessor.loadAudioAsFloatArray(
                 fromPath: fileURL.path,
@@ -94,6 +95,19 @@ final class LocalTranscriber: TranscriptionProvider {
             let chunkTexts = run.results.map(\.text)
             let merged = TranscriptMerger.merge(chunkTexts)
             reportCoverage(run: run, audioDuration: Double(audio.count) / Double(WhisperKit.sampleRate), chunkTexts: chunkTexts, mergedText: merged)
+            let total = Date().timeIntervalSince(start)
+            let audioSeconds = Double(audio.count) / Double(WhisperKit.sampleRate)
+            let timings = run.results.compactMap(\.timings)
+            print(String(
+                format: "[Murmur][Timing] transcribe: total %.2fs, audio %.1fs, rtf %.2f, chunks %d, prompt %d tok, encode %.2fs, prefill %.2fs, decode %.2fs (%d loops), fallbacks %d",
+                total, audioSeconds, audioSeconds > 0 ? total / audioSeconds : 0, run.chunkCount,
+                options.promptTokens?.count ?? 0,
+                timings.reduce(0) { $0 + $1.encoding },
+                timings.reduce(0) { $0 + $1.prefill },
+                timings.reduce(0) { $0 + $1.decodingLoop },
+                Int(timings.reduce(0) { $0 + $1.totalDecodingLoops }),
+                Int(timings.reduce(0) { $0 + $1.totalDecodingFallbacks })
+            ))
             return merged
         } catch {
             if Self.invalidatesModel(error) {

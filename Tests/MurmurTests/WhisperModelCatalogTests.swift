@@ -4,13 +4,14 @@ import XCTest
 final class WhisperModelCatalogTests: XCTestCase {
     // MARK: - Catalog
 
-    func testDefaultIsLargeV3Turbo() {
-        XCTAssertEqual(WhisperModelCatalog.defaultVariant, "large-v3-v20240930")
+    func testDefaultIsCompressedLargeV3Turbo() {
+        XCTAssertEqual(WhisperModelCatalog.defaultVariant, "large-v3-v20240930_turbo_632MB")
         XCTAssertTrue(WhisperModelCatalog.variants.contains(WhisperModelCatalog.defaultVariant))
     }
 
     func testLabelsAreHumanReadable() {
-        XCTAssertEqual(WhisperModelCatalog.label(for: "large-v3-v20240930"), "large-v3 turbo (best)")
+        XCTAssertEqual(WhisperModelCatalog.label(for: "large-v3-v20240930_turbo_632MB"), "large-v3 turbo (best)")
+        XCTAssertEqual(WhisperModelCatalog.label(for: "large-v3-v20240930"), "large-v3 turbo full-size (slower)")
         XCTAssertEqual(WhisperModelCatalog.label(for: "base.en"), "base.en")
         // Unknown variants fall back to the raw name rather than vanishing.
         XCTAssertEqual(WhisperModelCatalog.label(for: "medium"), "medium")
@@ -27,11 +28,17 @@ final class WhisperModelCatalogTests: XCTestCase {
     // MARK: - Stored-preference migration
 
     func testFreshInstallGetsDefault() {
-        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant(nil, migrationDone: false), "large-v3-v20240930")
+        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant(nil, migrationDone: false), "large-v3-v20240930_turbo_632MB")
     }
 
-    func testOldDefaultBaseIsUpgradedOnce() {
-        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant("base", migrationDone: false), "large-v3-v20240930")
+    func testOldDefaultsAreUpgradedOnce() {
+        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant("base", migrationDone: false), "large-v3-v20240930_turbo_632MB")
+        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant("large-v3-v20240930", migrationDone: false), "large-v3-v20240930_turbo_632MB")
+    }
+
+    func testFullTurboAfterMigrationIsKept() {
+        // A user who deliberately picks the full-size turbo keeps it.
+        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant("large-v3-v20240930", migrationDone: true), "large-v3-v20240930")
     }
 
     func testBaseAfterMigrationIsKeptAsItsEnglishVariant() {
@@ -50,6 +57,6 @@ final class WhisperModelCatalogTests: XCTestCase {
     }
 
     func testUnknownStoredVariantFallsBackToDefault() {
-        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant("medium", migrationDone: true), "large-v3-v20240930")
+        XCTAssertEqual(WhisperModelCatalog.resolveStoredVariant("medium", migrationDone: true), "large-v3-v20240930_turbo_632MB")
     }
 }

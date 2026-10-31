@@ -87,9 +87,10 @@ class AppState: ObservableObject {
     @Published var modelStatus: String = ""
 
     private static let modelVariantKey = "whisperModelVariant"
-    /// Set once the base -> large-v3 turbo default upgrade has run, so a user
-    /// who later picks a smaller model deliberately keeps it.
-    private static let modelMigrationKey = "didMigrateModelToLargeV3Turbo"
+    /// Set once the upgrade of an earlier default (base, full-size turbo) to
+    /// the current default has run, so a user who later picks one of those
+    /// deliberately keeps it. The key is versioned per default change.
+    private static let modelMigrationKey = "didMigrateModelToCompressedTurbo"
 
     // v0.1.0: Audio ducking
     @Published var duckMode: AudioDuckMode = .autoDuck {
@@ -236,7 +237,13 @@ class AppState: ObservableObject {
             let prompts = TranscriptionRetryLadder.prompts(for: prompt)
             var attempt: Int? = 0
             var lastError: Error?
+            let ladderStart = Date()
+            var passes = 0
+            defer {
+                print(String(format: "[Murmur][Timing] dictation: %d pass(es), %.2fs", passes, Date().timeIntervalSince(ladderStart)))
+            }
             while let index = attempt {
+                passes += 1
                 let attemptPrompt = prompts[index]
                 if index > 0 {
                     print("[Murmur] Retry \(index)/\(prompts.count - 1)\(attemptPrompt.isEmpty && !prompt.isEmpty ? " without prompt" : "")...")
