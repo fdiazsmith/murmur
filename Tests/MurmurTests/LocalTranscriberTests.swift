@@ -34,6 +34,31 @@ final class LocalTranscriberTests: XCTestCase {
         XCTAssertEqual(LocalTranscriber.maxPromptTokens, Constants.maxTokenContext / 2 - 1)
     }
 
+    // MARK: - Prompt + previous text
+
+    /// Fake tokenizer: one token per word, wrapped in specials like the real one.
+    private func encode(_ text: String) -> [Int] {
+        [50258] + text.split(separator: " ").map { Int($0.dropFirst())! } + [50257]
+    }
+
+    func testPreviousTextSitsAfterTheProfilePrompt() {
+        let tokens = LocalTranscriber.promptTokens(prompt: "w1 w2 w3", previousText: "w7 w8", specialTokenBegin: specialBegin, encode: encode)
+        XCTAssertEqual(tokens, [1, 2, 3, 7, 8])
+    }
+
+    func testPreviousTextIsCappedSoTheProfileKeepsTheBudget() {
+        let previous = (100..<200).map { "w\($0)" }.joined(separator: " ")
+        let prompt = (1...50).map { "w\($0)" }.joined(separator: " ")
+        let tokens = LocalTranscriber.promptTokens(prompt: prompt, previousText: previous, specialTokenBegin: specialBegin, limit: 30, previousLimit: 10, encode: encode)
+        XCTAssertEqual(tokens.count, 30)
+        XCTAssertEqual(Array(tokens.suffix(10)), Array(190..<200))
+        XCTAssertEqual(Array(tokens.prefix(20)), Array(31...50))
+    }
+
+    func testNoPromptAndNoContextMeansNoTokens() {
+        XCTAssertEqual(LocalTranscriber.promptTokens(prompt: " ", previousText: "", specialTokenBegin: specialBegin, encode: encode), [])
+    }
+
     // MARK: - Error classification
 
     func testPipelineErrorsInvalidateModel() {

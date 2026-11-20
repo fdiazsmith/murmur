@@ -152,16 +152,23 @@ enum TranscriptMerger {
     }
 
     /// Break text into trimmed, non-empty sentences, keeping terminal punctuation.
+    /// A sentence ends at `. ! ?` only when whitespace (or the end) follows,
+    /// so "v3.5", "index.ts" and "example.com" stay in one piece.
     static func splitSentences(_ text: String) -> [String] {
         var sentences: [String] = []
         var current = ""
-        for character in text {
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
             current.append(character)
-            if character == "." || character == "!" || character == "?" {
+            let next = text.index(after: index)
+            if character == "." || character == "!" || character == "?",
+               next == text.endIndex || text[next].isWhitespace {
                 let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { sentences.append(trimmed) }
                 current = ""
             }
+            index = next
         }
         let trailing = current.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trailing.isEmpty { sentences.append(trailing) }

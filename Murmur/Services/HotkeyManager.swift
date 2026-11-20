@@ -33,7 +33,30 @@ final class HotkeyManager {
 
     var currentConfig: HotkeyConfig { Self.config }
 
+    private var retryTimer: Timer?
+
+    /// Install the event tap. Without Accessibility permission the tap can't
+    /// be created; keep trying so the hotkey comes alive as soon as the user
+    /// grants it, instead of needing a relaunch.
     func start() {
+        guard eventTap == nil else { return }
+        if installTap() {
+            retryTimer?.invalidate()
+            retryTimer = nil
+            return
+        }
+        guard retryTimer == nil else { return }
+        print("[Murmur] Event tap unavailable — waiting for Accessibility permission")
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.start() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        retryTimer = timer
+    }
+
+    var isActive: Bool { eventTap != nil }
+
+    private func installTap() -> Bool {
         let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.flagsChanged.rawValue)
@@ -46,25 +69,27 @@ final class HotkeyManager {
             callback: HotkeyManager.eventCallback,
             userInfo: nil
         ) else {
-            print("[Murmur] Failed to create CGEvent tap — check Accessibility permission")
-            return
+            return false
         }
 
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
 
         self.eventTap = tap
         self.runLoopSource = source
         Self.tapRef = tap
         print("[Murmur] Global hotkey active (\(Self.config.displayString))")
+        return true
     }
 
     func stop() {
+        retryTimer?.invalidate()
+        retryTimer = nil
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
             if let source = runLoopSource {
-                CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
             }
             eventTap = nil
             runLoopSource = nil
@@ -81,7 +106,12 @@ final class HotkeyManager {
                 CGEvent.tapEnable(tap: tap, enable: true)
                 print("[Murmur] Event tap re-enabled after system disable")
             }
-            return Unmanaged.passRetained(event)
+            // The key-up may have been lost while the tap was off.
+            if isHotkeyHeld {
+                isHotkeyHeld = false
+                Task { @MainActor in appState?.stopRecordingAndTranscribe() }
+            }
+            return Unmanaged.passUnretained(event)
         }
 
         let flags = event.flags
@@ -93,7 +123,7 @@ final class HotkeyManager {
             handleKeyCombo(type: type, keyCode: keyCode, flags: flags)
         }
 
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
     }
 
     // MARK: - Modifier-only hotkey (e.g. Fn+Shift)
@@ -102,7 +132,10 @@ final class HotkeyManager {
     /// macOS generates intermediate flagsChanged events (e.g. Fn fires before Shift joins),
     /// so we wait briefly before treating a mismatch as a real release.
     private static var modifierReleaseWork: DispatchWorkItem?
-    private static let releaseDebounce: TimeInterval = 0.30
+    /// The recording keeps running through the debounce, so it doubles as
+    /// the tail capture — but it is also pure latency, so keep it short. Fn
+    /// combos are the ones that flicker, and get longer.
+    private static var releaseDebounce: TimeInterval { config.fn ? 0.20 : 0.10 }
 
     /// Check if all required modifiers are still held (inclusive — ignores extra modifiers)
     private static func hasRequiredModifiers(_ flags: CGEventFlags) -> Bool {
@@ -135,7 +168,7 @@ final class HotkeyManager {
             let work = DispatchWorkItem {
                 guard isHotkeyHeld else { return }
                 isHotkeyHeld = false
-                Task { @MainActor in appState?.stopRecordingAndTranscribe() }
+                Task { @MainActor in appState?.stopRecordingAndTranscribe(tailCaptured: true) }
             }
             modifierReleaseWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + releaseDebounce, execute: work)

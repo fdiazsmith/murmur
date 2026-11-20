@@ -8,14 +8,27 @@ final class CloudTranscriber: TranscriptionProvider {
         self.apiKey = apiKey
     }
 
-    func transcribe(fileURL: URL, prompt: String) async throws -> String {
+    let supportsStreaming = false
+
+    func transcribe(samples: [Float], context: TranscriptionContext) async throws -> String {
+        guard !apiKey.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw CloudTranscriberError.missingAPIKey
+        }
+        let prompt = context.prompt
+        let wavURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("wav")
+        try WavWriter.data(samples: samples).write(to: wavURL)
+        defer { try? FileManager.default.removeItem(at: wavURL) }
+
         // Compress WAV to m4a (AAC) for faster upload — typically 10-20x smaller
-        let (uploadData, filename, contentType) = try compressToM4A(from: fileURL)
+        let (uploadData, filename, contentType) = try compressToM4A(from: wavURL)
 
         let boundary = UUID().uuidString
 
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/audio/transcriptions")!)
         request.httpMethod = "POST"
+        request.timeoutInterval = 60
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = buildMultipartBody(audioData: uploadData, filename: filename, contentType: contentType, prompt: prompt, boundary: boundary)
@@ -60,7 +73,9 @@ final class CloudTranscriber: TranscriptionProvider {
                 AVEncoderBitRateKey: 64000,
             ]
 
-            let outputFile = try AVAudioFile(
+            // Optional so it can be released before the file is read back:
+            // AVAudioFile only finalizes the m4a when it is deallocated.
+            var outputFile: AVAudioFile? = try AVAudioFile(
                 forWriting: outputURL,
                 settings: outputSettings,
                 commonFormat: outputFormat.commonFormat,
@@ -74,8 +89,9 @@ final class CloudTranscriber: TranscriptionProvider {
 
             while inputFile.framePosition < inputFile.length {
                 try inputFile.read(into: buffer)
-                try outputFile.write(from: buffer)
+                try outputFile?.write(from: buffer)
             }
+            outputFile = nil
 
             let compressedData = try Data(contentsOf: outputURL)
             let originalSize = (try? FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? UInt64) ?? 0
@@ -119,6 +135,7 @@ final class CloudTranscriber: TranscriptionProvider {
         case invalidResponse
         case apiError(statusCode: Int, message: String)
         case compressionFailed
+        case missingAPIKey
 
         var errorDescription: String? {
             switch self {
@@ -128,6 +145,8 @@ final class CloudTranscriber: TranscriptionProvider {
                 return "OpenAI API error (\(statusCode)): \(message)"
             case .compressionFailed:
                 return "Failed to compress audio for upload"
+            case .missingAPIKey:
+                return "Add your OpenAI API key in the menu"
             }
         }
     }

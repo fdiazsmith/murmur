@@ -16,22 +16,35 @@ A lightweight alternative to Wispr Flow that runs entirely on-device via Whisper
 
 ## How it works
 
-1. **Hold** the floating pill (bottom-right of screen) or press **Ctrl+Shift+Space**
-2. **Speak** — Murmur records 16kHz mono audio via AVAudioEngine
-3. **Release** — audio is transcribed (locally or cloud) and pasted at your cursor
+1. **Hold** the floating pill or the global hotkey (default **Ctrl+Shift+Space**, configurable — modifier-only combos work too)
+2. **Speak** — the wordmark in the pill turns into a live waveform, and a bubble above it shows the transcript so far
+3. **Release** — the text is pasted at your cursor
 
-That's it. No click-toggle, no mode switching. Hold to speak, release to paste.
+Transcription starts while you are still speaking, not when you release:
+
+- at every pause, the audio so far is transcribed speculatively — if you release without saying more, the result is already there (or on its way);
+- at long pauses a dictation is split for good, so a five-minute dictation waits no longer on release than a five-second one;
+- on release only the unfinished tail is transcribed, and the pieces are stitched together.
+
+Measured on an M4 Pro with large-v3 turbo (`MURMUR_BENCH_AUDIO=… swift test -c release -Xswiftc -enable-testing --filter Benchmark`), release → text:
+
+| | all after release (old) | live, release mid-word | live, release after a beat |
+|---|---|---|---|
+| 7 s dictation | 0.6 s | 0.6–0.8 s | 0.3 s |
+| 42 s dictation | 2.1 s | 1.4 s | 1.0 s |
+
+A profile prompt adds ~7 ms per prompt token to every piece (WhisperKit decodes prompt tokens one step at a time), about 0.6 s for an 80-token prompt. Keep prompts short: a list of terms works as well as prose.
 
 ## Features
 
-- **Menu bar app** — mic icon in menu bar, no Dock icon, no window clutter
-- **Floating pill** — always-on-top capsule, changes color by state (gray/red/orange/green)
-- **Hold-to-speak** — natural press-and-hold interaction on pill or global hotkey
-- **Local transcription** — WhisperKit (CoreML/ANE) runs Whisper "base" model on-device
-- **Cloud transcription** — OpenAI Whisper API fallback, bring your own key
-- **Paste at cursor** — text goes directly into whatever app you're using via Cmd+V simulation
+- **Menu bar app** — no Dock icon, no window clutter
+- **Floating pill** — status light + cursive wordmark that becomes the waveform while you speak; shows short messages when something needs your attention ("No speech heard", "Mic is silent", "Copied — press ⌘V")
+- **Live preview** — optional transcript bubble while speaking (toggle in the menu)
+- **Local transcription** — WhisperKit (Core ML / Neural Engine), large-v3 turbo by default
+- **Cloud transcription** — OpenAI Whisper API, bring your own key
+- **Profiles** — per-profile prompts for vocabulary and style
+- **Paste at cursor** — Cmd+V simulation; your clipboard (all formats) is restored afterwards
 - **Screen capture excluded** — pill window won't appear in screenshots or recordings
-- **Global hotkey** — Ctrl+Shift+Space from anywhere, no need to reach the pill
 
 ## Requirements
 
@@ -50,7 +63,7 @@ swift build
 swift run Murmur
 ```
 
-First run downloads the WhisperKit "base" model (~140MB). Subsequent launches are instant.
+First run downloads the large-v3 turbo model (~630 MB). The first load after an install or OS update can take a couple of minutes while Core ML specializes the model for your chip; the pill says so while it happens.
 
 ## Permissions
 
@@ -62,17 +75,21 @@ On first launch, Murmur will request:
 ## Architecture
 
 ```
-MurmurApp (@main)
-  ├── MenuBarExtra (mic icon, dropdown with status/provider/quit)
+MurmurApp (@main) + AppDelegate (pill + hotkey start at launch)
+  ├── MenuBarExtra (status, profiles, provider, model, hotkey, audio, history)
   ├── PillWindowController (floating NSPanel, screen-capture excluded)
-  │     └── PillOverlay (SwiftUI: hold-to-speak, color/animation by state)
+  │     └── PillOverlay (interaction) → PillFace (visuals), TranscriptBubble
   └── AppState (state machine)
-        ├── AudioRecorder (AVAudioEngine → 16kHz mono WAV)
-        ├── TranscriptionProvider (protocol)
-        │     ├── LocalTranscriber (WhisperKit)
-        │     └── CloudTranscriber (OpenAI Whisper API)
+        ├── AudioRecorder (AVAudioEngine → 16 kHz mono samples, in memory)
+        │     └── AudioLevelMeter (level history for the waveform)
+        ├── DictationSession (one dictation, transcribed while recording)
+        │     ├── SpeechSegmenter (pause detection → speculate / split)
+        │     ├── TranscriptCleaner, TranscriptMerger (tidy + stitch pieces)
+        │     └── TranscriptionProvider
+        │           ├── LocalTranscriber (WhisperKit, streaming)
+        │           └── CloudTranscriber (OpenAI Whisper API, one upload)
         ├── PasteService (NSPasteboard + CGEvent Cmd+V)
-        └── HotkeyManager (CGEvent tap, Ctrl+Shift+Space)
+        └── HotkeyManager (CGEvent tap; retries until Accessibility is granted)
 ```
 
 ## License

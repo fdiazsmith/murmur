@@ -134,6 +134,47 @@ struct MurmurLogoShape: Shape {
     static let viewBox = CGRect(x: 0, y: 0, width: 252, height: 28)
     static let cached: CGPath = SVGPath.cgPath(from: murmurLogoPathData)
 
+    enum Element {
+        case move(CGPoint)
+        case line(CGPoint)
+        case curve(to: CGPoint, control1: CGPoint, control2: CGPoint)
+        case close
+    }
+
+    /// The wordmark's outline as plain elements in viewBox coordinates, for
+    /// drawing it with every point displaced (see `LivingLogo`).
+    static let elements: [Element] = {
+        var elements: [Element] = []
+        var current = CGPoint.zero
+        cached.applyWithBlock { pointer in
+            let element = pointer.pointee
+            let points = element.points
+            switch element.type {
+            case .moveToPoint:
+                current = points[0]
+                elements.append(.move(current))
+            case .addLineToPoint:
+                current = points[0]
+                elements.append(.line(current))
+            case .addQuadCurveToPoint:
+                // Elevate to a cubic so there is one curve case.
+                let control = points[0], end = points[1]
+                let control1 = CGPoint(x: current.x + (control.x - current.x) * 2 / 3, y: current.y + (control.y - current.y) * 2 / 3)
+                let control2 = CGPoint(x: end.x + (control.x - end.x) * 2 / 3, y: end.y + (control.y - end.y) * 2 / 3)
+                elements.append(.curve(to: end, control1: control1, control2: control2))
+                current = end
+            case .addCurveToPoint:
+                elements.append(.curve(to: points[2], control1: points[0], control2: points[1]))
+                current = points[2]
+            case .closeSubpath:
+                elements.append(.close)
+            @unknown default:
+                break
+            }
+        }
+        return elements
+    }()
+
     func path(in rect: CGRect) -> Path {
         let scale = min(rect.width / Self.viewBox.width, rect.height / Self.viewBox.height)
         let scaledSize = CGSize(width: Self.viewBox.width * scale, height: Self.viewBox.height * scale)

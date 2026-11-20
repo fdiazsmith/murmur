@@ -6,7 +6,12 @@ enum AppRecordingState: Equatable {
     case recording
     case transcribing
     case done(String)
+    /// Nothing went wrong, but nothing was pasted either ("No speech heard",
+    /// "Copied — press ⌘V").
+    case notice(String)
     case error(String)
+
+    var isBusy: Bool { self == .recording || self == .transcribing }
 }
 
 enum TranscriptionProviderType: String, CaseIterable {
@@ -29,8 +34,24 @@ class AppState: ObservableObject {
     @Published var lastTranscription: String = ""
     @Published var recordingElapsedTime: TimeInterval = 0
 
-    /// Live mic input level (0...1) while recording — drives the pill waveform.
-    @Published var audioLevel: Float = 0
+    /// The dictation being recorded / transcribed.
+    private var session: DictationSession?
+
+    /// The transcript so far while a dictation is in progress — shown in the
+    /// bubble above the pill.
+    @Published var partialText = ""
+
+    /// Show the live transcript bubble (and run preview passes to feed it).
+    @Published var livePreview = true {
+        didSet { UserDefaults.standard.set(livePreview, forKey: "livePreview") }
+    }
+
+    /// Release-to-paste time of the last dictation, shown in the menu.
+    @Published var lastLatency: TimeInterval?
+
+    /// Extra capture after release when the speaker was still mid-word, so
+    /// the last syllable isn't clipped.
+    private static let tailGrace: Duration = .milliseconds(120)
 
     // v0.1.0: Transcription history
     @Published var history: [TranscriptionEntry] = [] {
@@ -85,6 +106,9 @@ class AppState: ObservableObject {
     /// ("Loading model…", "Downloading model… 40%", "Ready"); shown under the
     /// model picker.
     @Published var modelStatus: String = ""
+
+    /// The local model is downloading / loading — dictations will wait for it.
+    var isModelLoading: Bool { !modelStatus.isEmpty && modelStatus != "Ready" }
 
     private static let modelVariantKey = "whisperModelVariant"
     /// Set once the upgrade of an earlier default (base, full-size turbo) to
@@ -158,6 +182,8 @@ class AppState: ObservableObject {
         }
         duckLevel = UserDefaults.standard.object(forKey: "duckLevel") as? Float ?? 0.2
 
+        livePreview = UserDefaults.standard.object(forKey: "livePreview") as? Bool ?? true
+
         loadHistory()
 
         // Load the model at launch so the first dictation isn't the one that
@@ -169,28 +195,43 @@ class AppState: ObservableObject {
     /// Start loading the local model in the background. No-op when the cloud
     /// provider is selected or the model is already loaded / loading.
     func warmUpLocalModel() {
-        guard selectedProvider == .local else { return }
+        guard selectedProvider == .local, !MicCheck.isRequested else { return }
         let transcriber = localTranscriber
         Task { await transcriber.warmup() }
     }
 
     func startRecording() {
         // Allow recording from idle, done, or error — only block if actively recording/transcribing
-        guard state != .recording, state != .transcribing else {
+        guard !state.isBusy else {
             print("[Murmur] startRecording skipped, state=\(state)")
             return
         }
         // Cancel any pending reset timer so it can't clobber this new session
         resetTask?.cancel()
         resetTask = nil
-        state = .idle
+
+        let provider = currentProvider
+        partialText = ""
+        let sessionBox = WeakSession()
+        let onPartial: @Sendable (String) -> Void = { [weak self] text in
+            Task { @MainActor [weak self] () -> Void in
+                self?.showPartial(text, from: sessionBox.session)
+            }
+        }
+        let session = DictationSession(
+            provider: provider,
+            profilePrompt: selectedProfile.prompt,
+            livePreview: livePreview,
+            onPartial: livePreview ? onPartial : nil
+        )
+        sessionBox.session = session
         do {
             audioDucker.duck(mode: duckMode, level: duckLevel)
             audioRecorder.onElapsedTimeUpdate = { [weak self] elapsed in
                 Task { @MainActor in self?.recordingElapsedTime = elapsed }
             }
-            audioRecorder.onLevelUpdate = { [weak self] level in
-                Task { @MainActor in self?.audioLevel = level }
+            audioRecorder.onSamples = { [session] samples in
+                session.append(samples)
             }
             audioRecorder.onAutoStop = { [weak self] in
                 Task { @MainActor in
@@ -199,90 +240,115 @@ class AppState: ObservableObject {
                 }
             }
             try audioRecorder.start()
+            self.session = session
             recordingElapsedTime = 0
             state = .recording
-            print("[Murmur] Recording started")
+            // Wake the Neural Engine while the user is still talking.
+            if selectedProvider == .local { localTranscriber.prime() }
+            print("[Murmur] Recording started (profile: \(selectedProfile.name), provider: \(selectedProvider.rawValue))")
         } catch {
             audioDucker.restore()
             print("[Murmur] Mic error: \(error)")
-            state = .error("Mic error: \(error.localizedDescription)")
+            state = .error(Permissions.isMicrophoneAuthorized ? "Mic error" : "Mic access needed")
             resetStateAfterDelay()
         }
     }
 
-    func stopRecordingAndTranscribe() {
+    /// - Parameter tailCaptured: the caller already kept recording briefly
+    ///   after the physical release (the hotkey's release debounce).
+    func stopRecordingAndTranscribe(tailCaptured: Bool = false) {
         // Always restore audio — safe even if not ducked
         audioDucker.restore()
-        audioLevel = 0
-        guard state == .recording else {
+        guard state == .recording, let session else {
             print("[Murmur] stopRecording skipped, state=\(state)")
             return
         }
-
-        guard let fileURL = audioRecorder.stop() else {
-            print("[Murmur] No audio file (too short or empty)")
-            state = .error("Recording too short")
-            resetStateAfterDelay()
-            return
-        }
-
-        print("[Murmur] Recording stopped, file: \(fileURL.lastPathComponent)")
         state = .transcribing
-        let provider = currentProvider
-        let prompt = selectedProfile.prompt
-        let providerName = selectedProvider.rawValue
-        print("[Murmur] Profile: \(selectedProfile.name), prompt: \(prompt.isEmpty ? "(empty)" : "\"\(prompt.prefix(40))\""), file: \(fileURL.path)")
+        let releasedAt = Date()
 
         Task {
-            let prompts = TranscriptionRetryLadder.prompts(for: prompt)
-            var attempt: Int? = 0
-            var lastError: Error?
-            let ladderStart = Date()
-            var passes = 0
-            defer {
-                print(String(format: "[Murmur][Timing] dictation: %d pass(es), %.2fs", passes, Date().timeIntervalSince(ladderStart)))
+            if !tailCaptured, session.trailingSilence < 0.15 {
+                try? await Task.sleep(for: Self.tailGrace)
             }
-            while let index = attempt {
-                passes += 1
-                let attemptPrompt = prompts[index]
-                if index > 0 {
-                    print("[Murmur] Retry \(index)/\(prompts.count - 1)\(attemptPrompt.isEmpty && !prompt.isEmpty ? " without prompt" : "")...")
-                    try? await Task.sleep(for: .milliseconds(300))
-                }
-                var emptyResult = false
-                do {
-                    print("[Murmur] Transcribing with \(providerName)...")
-                    let text = try await provider.transcribe(fileURL: fileURL, prompt: attemptPrompt)
-                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.isEmpty {
-                        print("[Murmur] Empty transcription")
-                        lastError = TranscriptionError.emptyResult
-                        emptyResult = true
-                    } else {
-                        let tail = trimmed.count > 160 ? " […] \(trimmed.suffix(80))" : ""
-                        print("[Murmur] Transcribed \(trimmed.count) chars: \(trimmed.prefix(80))\(tail)")
-                        lastTranscription = trimmed
-                        addToHistory(trimmed)
-                        PasteService.paste(trimmed)
-                        state = .done(trimmed)
-                        resetStateAfterDelay()
-                        return
-                    }
-                } catch {
-                    print("[Murmur] Transcription error (attempt \(index)): \(error)")
-                    lastError = error
-                }
-                attempt = TranscriptionRetryLadder.nextAttempt(after: index, in: prompts, emptyResult: emptyResult)
+            let duration = audioRecorder.stop()
+            defer { self.session = nil }
+
+            guard duration >= AudioRecorder.minimumDuration else {
+                print(String(format: "[Murmur] Recording too short (%.2fs), discarding", duration))
+                session.cancel()
+                finish(with: .notice("Hold to speak"))
+                return
             }
-            let message = lastError?.localizedDescription ?? "Unknown error"
-            state = .error("Transcription failed: \(message)")
-            resetStateAfterDelay()
+
+            let outcome = await session.finish()
+            let latency = Date().timeIntervalSince(releasedAt)
+            print(String(
+                format: "[Murmur][Timing] dictation: audio %.1fs, %d piece(s), %d failed, ahead=%@, release→text %.2fs",
+                outcome.audioDuration, outcome.pieceCount, outcome.failedPieces,
+                outcome.finishedAhead ? "yes" : "no", latency
+            ))
+            deliver(outcome, latency: latency)
         }
     }
 
-    private enum TranscriptionError: Error, LocalizedError {
-        case emptyResult
-        var errorDescription: String? { "Empty transcription" }
+    private func showPartial(_ text: String, from source: DictationSession?) {
+        // Ignore stragglers from a dictation that is already over.
+        guard let source, source === session else { return }
+        partialText = text
+    }
+
+    private func deliver(_ outcome: DictationSession.Outcome, latency: TimeInterval) {
+        if outcome.silent {
+            print("[Murmur] Mic delivered silence")
+            finish(with: .notice("Mic is silent"))
+            return
+        }
+        guard !outcome.text.isEmpty else {
+            if let error = outcome.error {
+                print("[Murmur] Transcription failed: \(error)")
+                finish(with: .error(Self.shortMessage(for: error)))
+            } else {
+                print("[Murmur] Empty transcription")
+                finish(with: .notice("No speech heard"))
+            }
+            return
+        }
+
+        let text = outcome.text
+        let tail = text.count > 160 ? " […] \(text.suffix(80))" : ""
+        print("[Murmur] Transcribed \(text.count) chars: \(text.prefix(80))\(tail)")
+        if outcome.failedPieces > 0 {
+            print("[Murmur] \(outcome.failedPieces) piece(s) failed — transcript is incomplete")
+        }
+        lastTranscription = text
+        lastLatency = latency
+        addToHistory(text)
+        switch PasteService.paste(text) {
+        case .pasted:
+            finish(with: .done(text))
+        case .copiedOnly:
+            _ = Permissions.requestAccessibilityAccess()
+            finish(with: .notice("Copied — press ⌘V"), after: .seconds(4))
+        }
+    }
+
+    private func finish(with newState: AppRecordingState, after delay: Duration = .seconds(2)) {
+        partialText = ""
+        state = newState
+        resetStateAfterDelay(delay)
+    }
+
+    /// A pill-sized message for a transcription error.
+    private static func shortMessage(for error: Error) -> String {
+        if let cloud = error as? CloudTranscriber.CloudTranscriberError {
+            switch cloud {
+            case .missingAPIKey: return "Add OpenAI API key"
+            case .apiError(let status, _): return status == 401 ? "API key rejected" : "OpenAI error \(status)"
+            default: return "Cloud error"
+            }
+        }
+        if (error as NSError).domain == NSURLErrorDomain { return "No connection" }
+        return "Transcription failed"
     }
 
     func clearHistory() {
@@ -358,39 +424,33 @@ class AppState: ObservableObject {
 
     /// Records 3 seconds to Desktop and opens the file for inspection.
     func debugCapture() {
-        state = .idle
+        guard !state.isBusy else { return }
+        let captured = CapturedSamples()
+        audioRecorder.onSamples = { captured.append($0) }
         do {
             try audioRecorder.start()
             state = .recording
             print("[Murmur][DEBUG] Capture started — recording 3s...")
         } catch {
             print("[Murmur][DEBUG] Capture failed to start: \(error)")
-            state = .error("Debug capture failed: \(error.localizedDescription)")
+            finish(with: .error("Mic error"))
             return
         }
         Task {
             try? await Task.sleep(for: .seconds(3))
-            guard let tmpURL = audioRecorder.stop() else {
-                print("[Murmur][DEBUG] No audio file produced")
-                state = .error("Debug: no audio captured")
-                resetStateAfterDelay()
-                return
-            }
-            let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
-            let dest = desktop.appendingPathComponent("murmur_debug.wav")
-            try? FileManager.default.removeItem(at: dest)
+            audioRecorder.stop()
+            let samples = captured.samples
+            let dest = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Desktop/murmur_debug.wav")
             do {
-                try FileManager.default.copyItem(at: tmpURL, to: dest)
-                let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
-                let size = (attrs?[.size] as? UInt64) ?? 0
-                print("[Murmur][DEBUG] Saved \(size) bytes → \(dest.path)")
+                try WavWriter.data(samples: samples).write(to: dest)
+                print("[Murmur][DEBUG] Saved \(samples.count) samples → \(dest.path)")
                 NSWorkspace.shared.open(dest)
-                state = .done("Debug: saved to Desktop")
+                finish(with: .notice("Saved to Desktop"))
             } catch {
-                print("[Murmur][DEBUG] Copy failed: \(error)")
-                state = .error("Debug: \(error.localizedDescription)")
+                print("[Murmur][DEBUG] Save failed: \(error)")
+                finish(with: .error("Save failed"))
             }
-            resetStateAfterDelay()
         }
     }
 
@@ -409,7 +469,7 @@ class AppState: ObservableObject {
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty {
                         print("[Murmur][DEBUG] WhisperKit returned empty text")
-                        self.state = .error("Debug: empty transcription")
+                        self.state = .notice("No speech heard")
                     } else {
                         print("[Murmur][DEBUG] Result: \(trimmed)")
                         self.lastTranscription = trimmed
@@ -417,7 +477,7 @@ class AppState: ObservableObject {
                     }
                 } catch {
                     print("[Murmur][DEBUG] Transcription error: \(error)")
-                    self.state = .error("Debug: \(error.localizedDescription)")
+                    self.state = .error("Transcription failed")
                 }
                 self.resetStateAfterDelay()
             }
@@ -447,12 +507,12 @@ class AppState: ObservableObject {
         }
     }
 
-    private func resetStateAfterDelay() {
+    private func resetStateAfterDelay(_ delay: Duration = .seconds(2)) {
         resetTask?.cancel()
         resetTask = Task {
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
-            if state != .recording && state != .transcribing {
+            if !state.isBusy {
                 audioDucker.restore()
                 state = .idle
             }
@@ -460,26 +520,18 @@ class AppState: ObservableObject {
     }
 }
 
-/// Retry plan for one dictation. Each attempt re-runs the whole recording, so
-/// with a large local model the ladder is kept short:
-///
-/// - with a profile prompt: prompt, prompt again, then no prompt — a prompt
-///   can steer Whisper into empty or garbage output, so the last rung drops it;
-/// - without one: a single retry.
-///
-/// A thrown error retries the same prompt (it may be transient). An empty
-/// result does not: decoding is deterministic, so the same prompt on the same
-/// audio would just reproduce it — skip to the next different prompt instead.
-enum TranscriptionRetryLadder {
-    static func prompts(for prompt: String) -> [String] {
-        prompt.isEmpty ? ["", ""] : [prompt, prompt, ""]
+private final class WeakSession: @unchecked Sendable {
+    weak var session: DictationSession?
+}
+
+/// Thread-safe sample accumulator for the debug capture.
+private final class CapturedSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Float] = []
+
+    func append(_ chunk: [Float]) {
+        lock.withLock { storage.append(contentsOf: chunk) }
     }
 
-    /// Index of the next attempt after attempt `index` failed, or nil to give up.
-    static func nextAttempt(after index: Int, in prompts: [String], emptyResult: Bool) -> Int? {
-        let next = index + 1
-        guard next < prompts.count else { return nil }
-        guard emptyResult else { return next }
-        return prompts[next...].firstIndex(where: { $0 != prompts[index] })
-    }
+    var samples: [Float] { lock.withLock { storage } }
 }

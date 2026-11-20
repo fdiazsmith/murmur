@@ -90,4 +90,16 @@ final class TranscriptMergerTests: XCTestCase {
         let result = TranscriptMerger.merge(["I know I know I know I know"])
         XCTAssertEqual(result, "I know I know I know I know")
     }
+
+    // MARK: - Dots that aren't sentence ends
+
+    func testDotsInsideTokensAreLeftAlone() {
+        let text = "Bump Node.js to v20.11.1 and update index.ts, e.g. the import from example.com."
+        XCTAssertEqual(TranscriptMerger.merge([text]), text)
+    }
+
+    func testEllipsisAndMixedPunctuationSurvive() {
+        let text = "Wait... really?! Yes."
+        XCTAssertEqual(TranscriptMerger.merge([text]), text)
+    }
 }
