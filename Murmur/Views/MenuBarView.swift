@@ -66,6 +66,11 @@ struct MenuBarView: View {
             Text(statusText)
                 .font(.headline)
         }
+        if let latency = appState.lastLatency {
+            Text(String(format: "Last dictation pasted in %.1fs", latency))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder
@@ -86,6 +91,9 @@ struct MenuBarView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+        if appState.selectedProvider == .local {
+            Toggle("Live preview while speaking", isOn: $appState.livePreview)
         }
         if appState.selectedProvider == .cloud {
             SecureField("OpenAI API Key", text: $appState.apiKey)
@@ -215,6 +223,7 @@ struct MenuBarView: View {
         case .recording: "Recording..."
         case .transcribing: "Transcribing..."
         case .done: "Done"
+        case .notice(let msg): msg
         case .error(let msg): msg
         }
     }
@@ -225,6 +234,7 @@ struct MenuBarView: View {
         case .recording: .red
         case .transcribing: .orange
         case .done: .green
+        case .notice: .yellow
         case .error: .red
         }
     }
@@ -251,7 +261,7 @@ struct MenuBarView: View {
         HotkeyConfig.clearSaved()
         PillWindowController.clearPosition()
         Profile.clearSaved()
-        for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck", "whisperModelVariant"] {
+        for key in ["selectedProvider", "openaiAPIKey", "duckMode", "duckLevel", "transcriptionHistory", "lastUpdateCheck", "whisperModelVariant", "livePreview", "inputDeviceUID"] {
             UserDefaults.standard.removeObject(forKey: key)
         }
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first

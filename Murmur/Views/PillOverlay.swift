@@ -1,121 +1,141 @@
 import SwiftUI
-import Combine
 
+/// The floating pill: `PillFace` plus everything interactive — hold to
+/// record, the profile menu on the orb, the drag handle and the hint chip.
 struct PillOverlay: View {
     @ObservedObject var appState: AppState
     @State private var isHovering = false
     @State private var isPressing = false
     @State private var isDragging = false
+    @State private var showHint = false
+    @State private var pressOwnsRecording = false
     @State private var mouseStart: CGPoint?
     @State private var windowStart: CGPoint?
 
-    static let pillWidth: CGFloat = 189
-    static let pillHeight: CGFloat = 34
-    private static let circleSize: CGFloat = 22
-    private static let recordRed = Color(red: 0.87, green: 0.36, blue: 0.32)
+    static let pillWidth = PillFace.maxWidth
+    static let pillHeight = PillFace.height
+    /// Transparent margin around the pill for glow, handle and hint.
+    static let inset: CGFloat = 40
+    /// Room above the pill for the live transcript bubble.
+    static let bubbleZone: CGFloat = 64
+    static let windowSize = CGSize(width: pillWidth + inset * 2, height: pillHeight + inset * 2 + bubbleZone)
+
+    private var phase: PillPhase { PillPhase(appState.state) }
 
     var body: some View {
-        VStack(spacing: 4) {
-            // Drag handle — visible on hover
+        VStack(spacing: 5) {
+            TranscriptBubble(text: appState.state.isBusy ? appState.partialText : "")
+                .frame(maxHeight: .infinity, alignment: .bottom)
+
+            VStack(spacing: 5) {
             dragHandle
-                .opacity(isHovering && !isPressing ? 1 : 0)
+                .opacity(isHovering && !isPressing && !appState.state.isBusy ? 1 : 0)
                 .animation(.easeInOut(duration: 0.15), value: isHovering)
 
-            // Pill body
-            ZStack {
-                Capsule()
-                    .fill(Color.black.opacity(0.5))
-                    .frame(width: Self.pillWidth, height: Self.pillHeight)
-                    .scaleEffect(scaleValue)
-                    .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+            PillFace(
+                phase: phase,
+                isHovering: isHovering,
+                durationFraction: appState.recordingElapsedTime / AudioRecorder.maxDuration,
+                meter: appState.audioRecorder.meter
+            )
+            .overlay(alignment: .leading) { hitAreas }
 
-                HStack(spacing: 0) {
-                    // Status circle / profile switcher — own hit target, no recording
-                    profileCircle
-
-                    // Recording area — takes the rest
-                    ZStack {
-                        if appState.state == .transcribing {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .scaleEffect(0.6)
-                                .colorInvert()
-                        } else if appState.state == .recording {
-                            WaveformView(appState: appState)
-                                .frame(height: Self.pillHeight - 9)
-                                .padding(.trailing, 14)
-                                .transition(.squashToLine)
-                        } else {
-                            MurmurLogoShape()
-                                .fill(.white)
-                                .frame(height: 13)
-                                .padding(.trailing, 14)
-                                .transition(.squashToLine)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { _ in
-                                guard !isPressing else { return }
-                                isPressing = true
-                                appState.startRecording()
-                            }
-                            .onEnded { _ in
-                                isPressing = false
-                                appState.stopRecordingAndTranscribe()
-                            }
-                    )
-                }
-                .frame(width: Self.pillWidth, height: Self.pillHeight)
+            hintChip
+                .frame(height: 18)
+            }
+            // Hover belongs to the pill, not the empty bubble area above it.
+            .onHover { hovering in
+                isHovering = hovering
+                if !hovering { showHint = false }
             }
         }
-        .onHover { hovering in
-            isHovering = hovering
+        .padding(.bottom, 12)
+        .task(id: isHovering) {
+            // Only explain after the pointer has rested on the pill.
+            guard isHovering else { return }
+            try? await Task.sleep(for: .milliseconds(650))
+            if !Task.isCancelled { showHint = true }
         }
-        .animation(.easeInOut(duration: 0.35), value: appState.state)
-        .frame(width: Self.pillWidth + 80, height: Self.pillHeight + 80)
+        .frame(width: Self.windowSize.width, height: Self.windowSize.height, alignment: .bottom)
     }
 
-    // MARK: - Status Circle / Profile Switcher
+    // MARK: - Interaction
 
-    private var menuEnabled: Bool {
-        appState.state != .recording && appState.state != .transcribing
-    }
-
-    private var profileCircle: some View {
-        // The dot is drawn directly — macOS Menu doesn't reliably render
-        // shape labels, so the menu sits on top as an invisible click layer.
-        statusDot
-            .overlay {
-                if menuEnabled {
-                    Menu {
-                        Picker("Profile", selection: $appState.selectedProfileId) {
-                            ForEach(appState.profiles) { profile in
-                                Text(profile.name).tag(profile.id)
-                            }
+    /// Invisible layer over the face: the orb opens the profile menu, the
+    /// rest is the hold-to-speak target.
+    private var hitAreas: some View {
+        HStack(spacing: 0) {
+            profileMenu
+                .frame(width: PillFace.lightSlot, height: Self.pillHeight)
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { _ in
+                            guard !isPressing else { return }
+                            isPressing = true
+                            // A click during a hotkey dictation must not end it.
+                            pressOwnsRecording = !appState.state.isBusy
+                            if pressOwnsRecording { appState.startRecording() }
                         }
-                        .pickerStyle(.inline)
-                        .labelsHidden()
-                    } label: {
-                        Color.clear
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                }
-            }
+                        .onEnded { _ in
+                            isPressing = false
+                            if pressOwnsRecording { appState.stopRecordingAndTranscribe() }
+                            pressOwnsRecording = false
+                        }
+                )
+        }
+        .frame(width: PillFace.width(for: phase), height: Self.pillHeight)
     }
 
-    private var statusDot: some View {
-        // Hit target spans the pill's full height, dot centered inside
-        ZStack {
-            Circle()
-                .fill(circleColor)
-                .frame(width: Self.circleSize, height: Self.circleSize)
+    @ViewBuilder
+    private var profileMenu: some View {
+        if appState.state.isBusy {
+            Color.clear
+        } else {
+            // macOS Menu doesn't reliably render shape labels, so the orb is
+            // drawn by the face and the menu sits on top as a click layer.
+            Menu {
+                Picker("Profile", selection: $appState.selectedProfileId) {
+                    ForEach(appState.profiles) { profile in
+                        Text(profile.name).tag(profile.id)
+                    }
+                }
+                .pickerStyle(.inline)
+                Divider()
+                Button("Edit Profiles…") { appState.showProfileEditor(profile: appState.selectedProfile) }
+            } label: {
+                Color.clear
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .contentShape(Rectangle())
         }
-        .frame(width: Self.circleSize + 12, height: Self.pillHeight)
-        .contentShape(Rectangle())
+    }
+
+    // MARK: - Hint
+
+    private var hintText: String? {
+        if appState.selectedProvider == .local, appState.isModelLoading {
+            return appState.modelStatus
+        }
+        if showHint, phase == .idle {
+            return "Hold \(appState.hotkeyConfig.displayString) to dictate"
+        }
+        return nil
+    }
+
+    private var hintChip: some View {
+        Text(hintText ?? " ")
+            .font(.system(size: 10, weight: .medium, design: .rounded))
+            .foregroundStyle(.white.opacity(0.9))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(.black.opacity(0.62)))
+            .opacity(hintText == nil ? 0 : 1)
+            .offset(y: hintText == nil ? -3 : 0)
+            .animation(.easeOut(duration: 0.18), value: hintText)
+            .allowsHitTesting(false)
     }
 
     // MARK: - Drag Handle
@@ -153,88 +173,53 @@ struct PillOverlay: View {
             }
     }
 
-    private var durationFraction: Double {
-        appState.recordingElapsedTime / AudioRecorder.maxDuration
-    }
-
-    private var circleColor: Color {
-        switch appState.state {
-        case .idle: return .white
-        case .recording:
-            // Warn as the 5-minute cap approaches
-            if durationFraction >= 0.80 && durationFraction < 0.95 { return .orange }
-            return Self.recordRed
-        case .transcribing: return .orange
-        case .done: return .green
-        case .error: return Self.recordRed.opacity(0.7)
-        }
-    }
-
-    private var scaleValue: CGFloat {
-        isHovering && appState.state != .recording ? 1.02 : 1.0
-    }
 }
 
-// MARK: - Logo <-> Waveform morph
+/// The transcript so far, floating above the pill while you speak — enough
+/// to see the words are landing, not a place to read them. Shows the tail.
+struct TranscriptBubble: View {
+    var text: String
 
-/// Squashes a view vertically into the pill's midline as it leaves (and grows
-/// it back as it enters) — the logo collapses to a flat line, the waveform
-/// expands out of it.
-private struct SquashToLineModifier: ViewModifier {
-    var squashed: Bool
-    func body(content: Content) -> some View {
-        content
-            .scaleEffect(x: 1, y: squashed ? 0.02 : 1)
-            .opacity(squashed ? 0 : 1)
+    /// Only the most recent words fit; older ones scroll off the front.
+    static let visibleCharacters = 84
+
+    private var tail: String {
+        guard text.count > Self.visibleCharacters else { return text }
+        let cut = text.suffix(Self.visibleCharacters)
+        // Start on a word boundary.
+        let start = cut.firstIndex(of: " ").map { cut.index(after: $0) } ?? cut.startIndex
+        return "…" + cut[start...]
     }
-}
-
-extension AnyTransition {
-    static var squashToLine: AnyTransition {
-        .modifier(active: SquashToLineModifier(squashed: true),
-                  identity: SquashToLineModifier(squashed: false))
-    }
-}
-
-// MARK: - Waveform
-
-/// Live scrolling waveform driven by mic level — newest audio enters on the
-/// right, the whole squiggle travels left, like the logo caught the sound.
-private struct WaveformView: View {
-    @ObservedObject var appState: AppState
-    @State private var samples: [CGFloat] = Array(repeating: 0, count: 48)
-    @State private var phase: CGFloat = 0
-    private let timer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        Canvas { context, size in
-            let midY = size.height / 2
-            let count = samples.count
-            let stepX = size.width / CGFloat(count - 1)
-            let maxAmp = size.height / 2 - 2
-            var points: [CGPoint] = []
-            points.reserveCapacity(count)
-            for i in 0..<count {
-                let x = CGFloat(i) * stepX
-                let y = midY + sin(CGFloat(i) * 0.85 - phase) * samples[i] * maxAmp
-                points.append(CGPoint(x: x, y: y))
+        ZStack(alignment: .bottom) {
+            if !text.isEmpty {
+                Text(tail)
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(2)
+                    .truncationMode(.head)
+                    .lineSpacing(1.5)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 7)
+                    .frame(maxWidth: 262, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(white: 0.09).opacity(0.94))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .strokeBorder(.white.opacity(0.14), lineWidth: 0.75)
+                            )
+                            .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
+                    )
+                    .contentTransition(.opacity)
+                    .transition(.scale(scale: 0.85, anchor: .bottom).combined(with: .opacity))
             }
-            var path = Path()
-            path.move(to: points[0])
-            for i in 1..<(count - 1) {
-                let mid = CGPoint(x: (points[i].x + points[i + 1].x) / 2,
-                                  y: (points[i].y + points[i + 1].y) / 2)
-                path.addQuadCurve(to: mid, control: points[i])
-            }
-            path.addLine(to: points[count - 1])
-            context.stroke(path, with: .color(.white),
-                           style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
         }
-        .onReceive(timer) { _ in
-            let level = min(1, CGFloat(appState.audioLevel) * 1.35)
-            samples.removeFirst()
-            samples.append(max(0.06, level))
-            phase += 0.6
-        }
+        .animation(.spring(response: 0.32, dampingFraction: 0.8), value: text.isEmpty)
+        .animation(.easeOut(duration: 0.18), value: text)
+        .allowsHitTesting(false)
     }
 }

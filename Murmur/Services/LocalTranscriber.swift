@@ -68,48 +68,69 @@ final class LocalTranscriber: TranscriptionProvider {
         lock.withLock { generation == loadGeneration }
     }
 
+    let supportsStreaming = true
+
+    /// Previous-text tokens kept as decoder context for a follow-on piece.
+    /// Every prompt token costs a decoder step (~7 ms on the Neural Engine),
+    /// so this is the tail only — enough for casing and continuity.
+    static let maxPreviousTextTokens = 24
+
+    /// One transcription at a time: WhisperKit's decoder state isn't safe to
+    /// share, and a cancelled speculative piece may still be inside its
+    /// (uncancellable) encoder pass when the next piece is ready.
+    private let gate = SerialGate()
+
+    /// Transcribe a wav/audio file (debug menu).
     func transcribe(fileURL: URL, prompt: String) async throws -> String {
         let kit = try await resolveWhisperKit()
+        let audio = try AudioProcessor.loadAudioAsFloatArray(
+            fromPath: fileURL.path,
+            channelMode: kit.audioInputConfig.channelMode
+        )
+        return try await transcribe(samples: audio, context: TranscriptionContext(prompt: prompt))
+    }
+
+    func transcribe(samples audio: [Float], context: TranscriptionContext) async throws -> String {
+        let kit = try await resolveWhisperKit()
+        await gate.acquire()
+        defer { Task { await gate.release() } }
+        try Task.checkCancellation()
 
         do {
             var options = Self.dictationDecodingOptions()
-            let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedPrompt.isEmpty, let tokenizer = kit.tokenizer {
-                // Leading space matches how the prompt text would appear mid-
-                // transcript (WhisperKit's CLI does the same).
-                let encoded = tokenizer.encode(text: " " + trimmedPrompt)
-                let tokens = Self.promptTokens(fromEncoded: encoded, specialTokenBegin: tokenizer.specialTokens.specialTokenBegin)
-                let textTokenCount = encoded.filter { $0 < tokenizer.specialTokens.specialTokenBegin }.count
-                if tokens.count < textTokenCount {
-                    print("[Murmur] Prompt trimmed to last \(tokens.count) of \(textTokenCount) tokens")
-                }
+            if let tokenizer = kit.tokenizer {
+                let tokens = Self.promptTokens(
+                    prompt: context.prompt,
+                    previousText: context.previousText,
+                    specialTokenBegin: tokenizer.specialTokens.specialTokenBegin,
+                    encode: { tokenizer.encode(text: $0) }
+                )
                 options.promptTokens = tokens.isEmpty ? nil : tokens
             }
             let start = Date()
             logCollector.beginRun()
-            let audio = try AudioProcessor.loadAudioAsFloatArray(
-                fromPath: fileURL.path,
-                channelMode: kit.audioInputConfig.channelMode
-            )
             let run = try await transcribeChunks(kit: kit, audio: audio, options: options)
+            try Task.checkCancellation()
             let chunkTexts = run.results.map(\.text)
             let merged = TranscriptMerger.merge(chunkTexts)
-            reportCoverage(run: run, audioDuration: Double(audio.count) / Double(WhisperKit.sampleRate), chunkTexts: chunkTexts, mergedText: merged)
-            let total = Date().timeIntervalSince(start)
             let audioSeconds = Double(audio.count) / Double(WhisperKit.sampleRate)
+            reportCoverage(run: run, audioDuration: audioSeconds, chunkTexts: chunkTexts, mergedText: merged)
+            let total = Date().timeIntervalSince(start)
             let timings = run.results.compactMap(\.timings)
             print(String(
-                format: "[Murmur][Timing] transcribe: total %.2fs, audio %.1fs, rtf %.2f, chunks %d, prompt %d tok, encode %.2fs, prefill %.2fs, decode %.2fs (%d loops), fallbacks %d",
+                format: "[Murmur][Timing] transcribe: total %.2fs, audio %.1fs, rtf %.2f, chunks %d, prompt %d tok, encode %.2fs, decode loops %d, fallbacks %d",
                 total, audioSeconds, audioSeconds > 0 ? total / audioSeconds : 0, run.chunkCount,
                 options.promptTokens?.count ?? 0,
                 timings.reduce(0) { $0 + $1.encoding },
-                timings.reduce(0) { $0 + $1.prefill },
-                timings.reduce(0) { $0 + $1.decodingLoop },
                 Int(timings.reduce(0) { $0 + $1.totalDecodingLoops }),
                 Int(timings.reduce(0) { $0 + $1.totalDecodingFallbacks })
             ))
+            lock.withLock { lastInference = Date() }
             return merged
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             if Self.invalidatesModel(error) {
                 print("[Murmur] WhisperKit pipeline error, will reload model next call: \(error)")
                 invalidate(ifCurrent: kit)
@@ -117,6 +138,34 @@ final class LocalTranscriber: TranscriptionProvider {
                 print("[Murmur] WhisperKit error (model kept loaded): \(error)")
             }
             throw error
+        }
+    }
+
+    // MARK: - Keeping the model hot
+
+    private var lastInference: Date?
+
+    /// Core ML powers the Neural Engine down after a while idle, and the first
+    /// prediction afterwards pays for waking it. Called when recording starts:
+    /// run a throwaway pass over silence so the wake-up overlaps the speaker's
+    /// first words instead of the wait after release.
+    func prime(ifIdleFor idle: TimeInterval = 20) {
+        let (kit, last) = lock.withLock { (loadedKit, lastInference) }
+        guard let kit else { return }
+        if let last, Date().timeIntervalSince(last) < idle { return }
+        Task(priority: .userInitiated) {
+            await gate.acquire()
+            defer { Task { await gate.release() } }
+            var options = Self.dictationDecodingOptions()
+            options.temperatureFallbackCount = 0
+            let silence = [Float](repeating: 0, count: WhisperKit.sampleRate * 2)
+            let start = Date()
+            // Stop after the first token via the callback. (Don't shorten
+            // `sampleLength` instead: WhisperKit traps when it is smaller
+            // than its prefilled token count.)
+            _ = try? await kit.transcribe(audioArray: silence, decodeOptions: options, callback: { _ in false })
+            lock.withLock { lastInference = Date() }
+            print(String(format: "[Murmur][Timing] primed model in %.2fs", Date().timeIntervalSince(start)))
         }
     }
 
@@ -141,11 +190,21 @@ final class LocalTranscriber: TranscriptionProvider {
         let chunks = try await chunker.chunkAll(audioArray: audio, maxChunkLength: windowSamples, decodeOptions: options)
         guard !chunks.isEmpty else { throw WhisperError.transcriptionFailed("No audio to transcribe") }
 
-        let firstPass = await kit.transcribeWithOptions(
+        let cancellation = CancellationFlag()
+        let firstPass = await withTaskCancellationHandler {
+            await kit.transcribeWithOptions(
             audioArrays: chunks.map(\.audioSamples),
             decodeOptionsArray: Array(repeating: options, count: chunks.count),
-            seekOffsets: chunks.map(\.seekOffsetIndex)
-        )
+            seekOffsets: chunks.map(\.seekOffsetIndex),
+            // Returning false stops decoding at the next token. WhisperKit
+            // calls this from a detached task, so cancellation has to be
+            // carried in by hand.
+            callback: { _ in cancellation.isCancelled ? false : nil }
+            )
+        } onCancel: {
+            cancellation.cancel()
+        }
+        try Task.checkCancellation()
         let outcome = await ChunkRecovery.recover(firstPass) { index in
             let chunk = chunks[index]
             if case let .failure(error) = firstPass[index] {
@@ -217,6 +276,29 @@ final class LocalTranscriber: TranscriptionProvider {
     /// sits next to the audio.
     static func promptTokens(fromEncoded encoded: [Int], specialTokenBegin: Int, limit: Int = maxPromptTokens) -> [Int] {
         Array(encoded.filter { $0 < specialTokenBegin }.suffix(limit))
+    }
+
+    /// The decoder prompt for one piece: the profile prompt, then the tail of
+    /// what was just transcribed (closest to the audio, like Whisper's own
+    /// previous-segment conditioning). The previous text is capped so the
+    /// profile's vocabulary keeps most of the budget.
+    static func promptTokens(
+        prompt: String,
+        previousText: String,
+        specialTokenBegin: Int,
+        limit: Int = maxPromptTokens,
+        previousLimit: Int = maxPreviousTextTokens,
+        encode: (String) -> [Int]
+    ) -> [Int] {
+        func tokens(_ text: String, limit: Int) -> [Int] {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, limit > 0 else { return [] }
+            // Leading space matches how the text would appear mid-transcript
+            // (WhisperKit's CLI does the same).
+            return promptTokens(fromEncoded: encode(" " + trimmed), specialTokenBegin: specialTokenBegin, limit: limit)
+        }
+        let previous = tokens(previousText, limit: min(previousLimit, limit))
+        return tokens(prompt, limit: limit - previous.count) + previous
     }
 
     /// Whether an error means the loaded model / pipeline is broken (reload it)
@@ -415,4 +497,14 @@ final class LocalTranscriber: TranscriptionProvider {
         }
         return complete ? folder : nil
     }
+}
+
+/// Cancellation state that can be read from any task.
+final class CancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool { lock.withLock { cancelled } }
+
+    func cancel() { lock.withLock { cancelled = true } }
 }

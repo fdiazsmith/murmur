@@ -3,46 +3,54 @@ import AppKit
 
 @main
 struct MurmurApp: App {
-    @StateObject private var appState = AppState()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(appState: appState)
-                .task {
-                    _ = await Permissions.requestMicrophoneAccess()
-                    _ = Permissions.requestAccessibilityAccess()
-                    showPillIfNeeded()
-                    appState.checkForUpdates()
-                }
+            MenuBarView(appState: delegate.appState)
         } label: {
-            if let nsImage = Self.loadMenuBarIcon() {
-                Image(nsImage: nsImage)
-            } else {
-                Image(systemName: "mic.fill")
-            }
+            MenuBarLabel(appState: delegate.appState)
         }
     }
+}
 
-    private static func loadMenuBarIcon() -> NSImage? {
-        guard let url = Bundle.module.url(
-            forResource: "MenuBarIcon@2x",
-            withExtension: "png",
-            subdirectory: "Resources"
-        ), let image = NSImage(contentsOf: url) else { return nil }
-        image.isTemplate = true
-        image.size = NSSize(width: 22, height: 22)
-        return image
+/// Menu bar icon; switches to a waveform while recording.
+private struct MenuBarLabel: View {
+    @ObservedObject var appState: AppState
+
+    var body: some View {
+        Image(systemName: appState.state == .recording ? "waveform" : "mic.fill")
     }
+}
 
-    @MainActor
-    private func showPillIfNeeded() {
-        let controller = PillWindowController(appState: appState)
-        controller.showPill()
-        // Store in appState to retain
-        appState.pillController = controller
+/// Starts the pill and the global hotkey at launch — not from the menu's
+/// view lifecycle, which only runs once the menu has been built.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    lazy var appState = AppState()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if MicCheck.isRequested {
+            // Diagnostic run: no pill, no hotkey, no paste.
+            Task {
+                await MicCheck.run()
+                exit(0)
+            }
+            return
+        }
+        let pill = PillWindowController(appState: appState)
+        pill.showPill()
+        appState.pillController = pill
 
         let hotkey = HotkeyManager(appState: appState)
-        hotkey.start()
         appState.hotkeyManager = hotkey
+
+        Task {
+            _ = await Permissions.requestMicrophoneAccess()
+            _ = Permissions.requestAccessibilityAccess()
+            // Retries on its own until Accessibility is granted.
+            hotkey.start()
+            appState.checkForUpdates()
+        }
     }
 }

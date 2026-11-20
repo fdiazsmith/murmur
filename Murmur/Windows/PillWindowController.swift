@@ -11,7 +11,7 @@ class PillWindowController {
     private(set) var panel: NSPanel?
     private let appState: AppState
 
-    private let inset: CGFloat = 40
+    private let inset: CGFloat = PillOverlay.inset
     private let pillWidth: CGFloat = PillOverlay.pillWidth
     private let pillHeight: CGFloat = PillOverlay.pillHeight
 
@@ -19,8 +19,8 @@ class PillWindowController {
         self.appState = appState
     }
 
-    private var windowWidth: CGFloat { pillWidth + inset * 2 }
-    private var windowHeight: CGFloat { pillHeight + inset * 2 }
+    private var windowWidth: CGFloat { PillOverlay.windowSize.width }
+    private var windowHeight: CGFloat { PillOverlay.windowSize.height }
 
     func showPill() {
         guard panel == nil else { return }
